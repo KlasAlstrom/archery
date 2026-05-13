@@ -52,24 +52,29 @@ def start_ffmpeg():
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",
+
         "-f", "v4l2",
         "-input_format", "mjpeg",
         "-video_size", f'{cfg["camera"]["width"]}x{cfg["camera"]["height"]}',
         "-framerate", str(cfg["camera"]["fps"]),
         "-i", cfg["camera"]["device"],
+
         "-an",
-        "-vf", "scale=1280:720,format=yuv420p",
+        "-vf", "format=yuv420p",
         "-c:v", "libx264",
         "-preset", "ultrafast",
         "-crf", "28",
+
         "-g", str(cfg["camera"]["fps"]),
         "-keyint_min", str(cfg["camera"]["fps"]),
         "-sc_threshold", "0",
+
         "-f", "segment",
         "-segment_time", str(SEGMENT_SECONDS),
         "-segment_wrap", str(SEGMENT_COUNT),
         "-segment_format", "mpegts",
         "-reset_timestamps", "1",
+
         str(SEGMENT_PATTERN),
     ]
 
