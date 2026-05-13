@@ -31,3 +31,19 @@ Verify
 python3 -c "import aiohttp; print('OK')"
 
 python3 main.py
+
+-------------------------------
+On another computer/pi
+
+Create the storage directory:
+sudo mkdir -p /srv/video-storage
+sudo chmod 777 /srv/video-storage
+
+Start the server
+
+From video-server/:
+docker compose up -d --build
+
+Check:
+curl http://localhost/api/health
+

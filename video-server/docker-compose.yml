@@ -1,0 +1,27 @@
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_DB: videos
+      POSTGRES_USER: video
+      POSTGRES_PASSWORD: video-password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  app:
+    build: ./app
+    ports:
+      - "80:8000"
+    environment:
+      DATABASE_URL: postgresql://video:video-password@postgres:5432/videos
+      VIDEO_STORAGE: /video-storage
+      NODE_TOKEN: archery-video-2026
+    volumes:
+      - /srv/video-storage:/video-storage
+    depends_on:
+      - postgres
+    restart: unless-stopped
+
+volumes:
+  postgres-data:

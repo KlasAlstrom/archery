@@ -20,7 +20,7 @@ trigger:
 
 server:
   upload_url: http://192.168.1.10/api/upload
-  token: change-me
+  token: archery-video-2026
 
 clip:
   max_retry_seconds: 30
