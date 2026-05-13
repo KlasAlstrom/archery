@@ -1,0 +1,25 @@
+node_id: node-01
+
+camera:
+  device: /dev/video0
+  width: 1280
+  height: 720
+  fps: 30
+  input_format: h264
+
+buffer:
+  base_dir: /dev/shm/video-node
+  segment_count: 10
+  segment_seconds: 1
+
+trigger:
+  pre_seconds: 3
+  post_seconds: 3
+  port: 8080
+
+server:
+  upload_url: http://192.168.1.10/api/upload
+  token: change-me
+
+clip:
+  max_retry_seconds: 30
