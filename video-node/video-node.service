@@ -1,0 +1,16 @@
+[Unit]
+Description=Video Node Recorder
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=klas
+Group=video
+WorkingDirectory=/home/klas/archery/video-node
+ExecStart=/home/klas/archery/video-node/venv/bin/python /home/klas/archery/video-node/main.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

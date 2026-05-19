@@ -40,6 +40,29 @@ trigger_queue: asyncio.Queue = asyncio.Queue()
 ffmpeg_process: subprocess.Popen | None = None
 
 
+async def heartbeat_worker():
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    heartbeat_url = UPLOAD_URL.replace("/api/upload", "/api/heartbeat")
+
+    while True:
+        try:
+            async with aiohttp.ClientSession() as session:
+                data = aiohttp.FormData()
+                data.add_field("node_id", NODE_ID)
+                data.add_field("status", "ok")
+
+                await session.post(
+                    heartbeat_url,
+                    data=data,
+                    headers=headers,
+                    timeout=5,
+                )
+        except Exception as e:
+            print(f"Heartbeat failed: {e}")
+
+        await asyncio.sleep(30)
+
 def ensure_dirs():
     SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
@@ -251,7 +274,7 @@ async def startup():
 
     asyncio.create_task(monitor_ffmpeg())
     asyncio.create_task(trigger_worker())
-
+    asyncio.create_task(heartbeat_worker())
 
 if __name__ == "__main__":
     uvicorn.run(
