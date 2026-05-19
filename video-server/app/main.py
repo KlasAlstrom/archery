@@ -42,6 +42,10 @@ class Node(Base):
     last_seen = Column(DateTime, nullable=False)
     status = Column(String, nullable=False)
 
+def utc_iso(dt):
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 @app.on_event("startup")
 def startup():
@@ -130,7 +134,7 @@ def list_videos(
                     "id": v.id,
                     "node_id": v.node_id,
                     "event_id": v.event_id,
-                    "created_at": v.created_at.isoformat(),
+                    "created_at": utc_iso(v.created_at),
                     "duration_seconds": v.duration_seconds,
                     "filesize_bytes": v.filesize_bytes,
                 }
@@ -207,7 +211,7 @@ def list_nodes():
                 "node_id": n.node_id,
                 "ip_address": n.ip_address,
                 "status": "online" if now - last_seen < timedelta(minutes=2) else "offline",
-                "last_seen": last_seen.isoformat(),
+                "last_seen": utc_iso(last_seen),
             })
 
         return result
@@ -317,6 +321,19 @@ function fmtSize(bytes) {
   return Math.round(bytes / 1024 / 1024 * 10) / 10 + " MB";
 }
 
+function fmtLocalTime(isoString) {
+  const date = new Date(isoString);
+
+  return date.toLocaleString(undefined, {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
+}
+
 async function loadNodes() {
   const res = await fetch('/api/nodes');
   const nodes = await res.json();
@@ -328,7 +345,7 @@ async function loadNodes() {
 
   for (const n of nodes) {
     const div = document.createElement('div');
-    div.innerHTML = `${n.node_id}: <span class="${n.status}">${n.status}</span><br><small>Last seen: ${n.last_seen}</small>`;
+    div.innerHTML = `${n.node_id}: <span class="${n.status}">${n.status}</span><br><small>Last seen: ${fmtLocalTime(n.last_seen)}</small>`;
     container.appendChild(div);
 
     if (!knownNodes.has(n.node_id)) {
@@ -363,19 +380,19 @@ async function loadVideos(resetOffset = false) {
     const div = document.createElement('div');
     div.className = 'event';
 
-    const date = new Date(v.created_at);
+    const localTime = fmtLocalTime(v.created_at);
 
     div.innerHTML = `
-      <b>${date.toLocaleString()}</b><br>
-      <small>${v.node_id} | ${v.duration_seconds}s | ${fmtSize(v.filesize_bytes)}</small>
+    <b>${localTime}</b><br>
+    <small>${v.node_id} | ${v.duration_seconds}s | ${fmtSize(v.filesize_bytes)}</small>
     `;
 
     div.onclick = () => {
-      document.getElementById('player').src = `/api/video/${v.id}`;
-      document.getElementById('playerTitle').innerText =
-        `${v.node_id} — ${date.toLocaleString()}`;
-      document.getElementById('player').play();
-    };
+    document.getElementById('player').src = `/api/video/${v.id}`;
+    document.getElementById('playerTitle').innerText =
+        `${v.node_id} — ${localTime}`;
+    document.getElementById('player').play();
+    };    
 
     container.appendChild(div);
   }
