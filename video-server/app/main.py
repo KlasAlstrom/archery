@@ -290,6 +290,13 @@ def index():
     <div class="panel">
       <h2 id="playerTitle">Player</h2>
       <video id="player" controls preload="metadata"></video>
+
+      <div style="margin-top: 10px;">
+      <button onclick="slowMotion()">Slow motion</button>
+      <button onclick="normalSpeed()">Normal speed</button>
+      <button onclick="stepBack()">Frame back</button>
+      <button onclick="stepForward()">Frame forward</button>
+      </div>      
     </div>
   </div>
 
@@ -387,6 +394,30 @@ async function loadVideos(resetOffset = false) {
   nav.appendChild(prev);
   nav.appendChild(next);
   container.appendChild(nav);
+}
+
+const FPS = 30;
+
+function slowMotion() {
+  const player = document.getElementById('player');
+  player.playbackRate = 0.25;
+}
+
+function normalSpeed() {
+  const player = document.getElementById('player');
+  player.playbackRate = 1.0;
+}
+
+function stepForward() {
+  const player = document.getElementById('player');
+  player.pause();
+  player.currentTime += 1 / FPS;
+}
+
+function stepBack() {
+  const player = document.getElementById('player');
+  player.pause();
+  player.currentTime = Math.max(0, player.currentTime - 1 / FPS);
 }
 
 async function refreshAll() {
