@@ -105,7 +105,11 @@ async def upload_video(
 
 
 @app.get("/api/videos")
-def list_videos(limit: int = 100, node_id: str | None = None):
+def list_videos(
+    limit: int = 100,
+    offset: int = 0,
+    node_id: str | None = None,
+):
     db = SessionLocal()
     try:
         q = db.query(Video).order_by(Video.created_at.desc())
@@ -113,19 +117,25 @@ def list_videos(limit: int = 100, node_id: str | None = None):
         if node_id:
             q = q.filter(Video.node_id == node_id)
 
-        rows = q.limit(limit).all()
+        total = q.count()
+        rows = q.offset(offset).limit(limit).all()
 
-        return [
-            {
-                "id": v.id,
-                "node_id": v.node_id,
-                "event_id": v.event_id,
-                "created_at": v.created_at.isoformat(),
-                "duration_seconds": v.duration_seconds,
-                "filesize_bytes": v.filesize_bytes,
-            }
-            for v in rows
-        ]
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": [
+                {
+                    "id": v.id,
+                    "node_id": v.node_id,
+                    "event_id": v.event_id,
+                    "created_at": v.created_at.isoformat(),
+                    "duration_seconds": v.duration_seconds,
+                    "filesize_bytes": v.filesize_bytes,
+                }
+                for v in rows
+            ],
+        }
     finally:
         db.close()
 
@@ -266,7 +276,7 @@ def index():
 
       <div class="panel">
         <h2>Events</h2>
-        <select id="nodeFilter" onchange="loadVideos()">
+        <select id="nodeFilter" onchange="loadVideos(true)">
           <option value="">All nodes</option>
         </select>
         <button onclick="loadVideos()">Refresh</button>
@@ -281,6 +291,8 @@ def index():
   </div>
 
 <script>
+let offset = 0;
+const limit = 100;
 let knownNodes = new Set();
 
 function fmtSize(bytes) {
@@ -311,16 +323,23 @@ async function loadNodes() {
   }
 }
 
-async function loadVideos() {
+async function loadVideos(resetOffset = false) {
+  if (resetOffset) offset = 0;
+
   const node = document.getElementById('nodeFilter').value;
-  let url = '/api/videos?limit=100';
+  let url = `/api/videos?limit=${limit}&offset=${offset}`;
   if (node) url += '&node_id=' + encodeURIComponent(node);
 
   const res = await fetch(url);
-  const videos = await res.json();
+  const data = await res.json();
+  const videos = data.items;
 
   const container = document.getElementById('events');
   container.innerHTML = '';
+
+  const info = document.createElement('div');
+  info.innerHTML = `<small>Showing ${offset + 1}-${Math.min(offset + limit, data.total)} of ${data.total}</small>`;
+  container.appendChild(info);
 
   for (const v of videos) {
     const div = document.createElement('div');
@@ -342,11 +361,34 @@ async function loadVideos() {
 
     container.appendChild(div);
   }
+
+  const nav = document.createElement('div');
+  nav.style.marginTop = '10px';
+
+  const prev = document.createElement('button');
+  prev.innerText = 'Previous';
+  prev.disabled = offset === 0;
+  prev.onclick = () => {
+    offset = Math.max(0, offset - limit);
+    loadVideos();
+  };
+
+  const next = document.createElement('button');
+  next.innerText = 'Next';
+  next.disabled = offset + limit >= data.total;
+  next.onclick = () => {
+    offset += limit;
+    loadVideos();
+  };
+
+  nav.appendChild(prev);
+  nav.appendChild(next);
+  container.appendChild(nav);
 }
 
 async function refreshAll() {
   await loadNodes();
-  await loadVideos();
+  await loadVideos(false);
 }
 
 refreshAll();
