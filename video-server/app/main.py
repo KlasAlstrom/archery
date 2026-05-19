@@ -251,6 +251,14 @@ def index():
 <html>
 <head>
   <title>Video Events</title>
+  <div style="margin-bottom: 15px;">
+    <button onclick="triggerAllNodes()">
+      Trigger All Nodes
+    </button>
+
+    <span id="triggerStatus" style="margin-left: 10px;"></span>
+  </div>
+    
   <style>
     body { font-family: sans-serif; margin: 20px; background: #f6f6f6; }
     h1 { margin-bottom: 10px; }
@@ -394,6 +402,32 @@ async function loadVideos(resetOffset = false) {
   nav.appendChild(prev);
   nav.appendChild(next);
   container.appendChild(nav);
+}
+
+async function triggerAllNodes() {
+  const status = document.getElementById('triggerStatus');
+
+  status.innerText = 'Triggering...';
+
+  try {
+    const res = await fetch('/api/trigger-all', {
+      method: 'POST'
+    });
+
+    const data = await res.json();
+
+    const ok = data.results.filter(r => r.ok).length;
+    const total = data.results.length;
+
+    status.innerText = `Triggered ${ok}/${total} nodes`;
+
+    setTimeout(() => {
+      status.innerText = '';
+    }, 5000);
+
+  } catch (e) {
+    status.innerText = 'Trigger failed';
+  }
 }
 
 const FPS = 30;
