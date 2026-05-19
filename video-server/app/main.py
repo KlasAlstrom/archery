@@ -183,17 +183,23 @@ def list_nodes():
         now = datetime.now(timezone.utc)
         rows = db.query(Node).order_by(Node.node_id).all()
 
-        return [
-            {
+        result = []
+
+        for n in rows:
+            last_seen = n.last_seen
+
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+
+            result.append({
                 "node_id": n.node_id,
-                "status": "online" if now - n.last_seen < timedelta(minutes=2) else "offline",
-                "last_seen": n.last_seen.isoformat(),
-            }
-            for n in rows
-        ]
+                "status": "online" if now - last_seen < timedelta(minutes=2) else "offline",
+                "last_seen": last_seen.isoformat(),
+            })
+
+        return result
     finally:
         db.close()
-
 
 @app.post("/api/cleanup")
 def cleanup_old_videos(authorization: str | None = Header(default=None)):
@@ -233,52 +239,122 @@ def index():
 <head>
   <title>Video Events</title>
   <style>
-    body { font-family: sans-serif; margin: 20px; }
-    .layout { display: grid; grid-template-columns: 420px 1fr; gap: 20px; }
-    .event { padding: 8px; border-bottom: 1px solid #ddd; cursor: pointer; }
+    body { font-family: sans-serif; margin: 20px; background: #f6f6f6; }
+    h1 { margin-bottom: 10px; }
+    .layout { display: grid; grid-template-columns: 460px 1fr; gap: 20px; }
+    .panel { background: white; padding: 14px; border-radius: 8px; }
+    .event { padding: 10px; border-bottom: 1px solid #ddd; cursor: pointer; }
     .event:hover { background: #eee; }
-    video { width: 100%; max-height: 80vh; background: black; }
+    .event small { color: #555; }
+    video { width: 100%; max-height: 75vh; background: black; }
+    select, button { padding: 6px; margin-right: 6px; }
+    .online { color: green; font-weight: bold; }
+    .offline { color: red; font-weight: bold; }
   </style>
 </head>
 <body>
   <h1>Video Events</h1>
+
   <div class="layout">
     <div>
-      <h2>Events</h2>
-      <div id="events"></div>
+      <div class="panel">
+        <h2>Nodes</h2>
+        <div id="nodes">Loading...</div>
+      </div>
+
+      <br>
+
+      <div class="panel">
+        <h2>Events</h2>
+        <select id="nodeFilter" onchange="loadVideos()">
+          <option value="">All nodes</option>
+        </select>
+        <button onclick="loadVideos()">Refresh</button>
+        <div id="events"></div>
+      </div>
     </div>
-    <div>
-      <h2>Player</h2>
-      <video id="player" controls></video>
+
+    <div class="panel">
+      <h2 id="playerTitle">Player</h2>
+      <video id="player" controls preload="metadata"></video>
     </div>
   </div>
 
 <script>
+let knownNodes = new Set();
+
+function fmtSize(bytes) {
+  return Math.round(bytes / 1024 / 1024 * 10) / 10 + " MB";
+}
+
+async function loadNodes() {
+  const res = await fetch('/api/nodes');
+  const nodes = await res.json();
+
+  const container = document.getElementById('nodes');
+  container.innerHTML = '';
+
+  const filter = document.getElementById('nodeFilter');
+
+  for (const n of nodes) {
+    const div = document.createElement('div');
+    div.innerHTML = `${n.node_id}: <span class="${n.status}">${n.status}</span><br><small>Last seen: ${n.last_seen}</small>`;
+    container.appendChild(div);
+
+    if (!knownNodes.has(n.node_id)) {
+      knownNodes.add(n.node_id);
+      const opt = document.createElement('option');
+      opt.value = n.node_id;
+      opt.textContent = n.node_id;
+      filter.appendChild(opt);
+    }
+  }
+}
+
 async function loadVideos() {
-  const res = await fetch('/api/videos?limit=100');
+  const node = document.getElementById('nodeFilter').value;
+  let url = '/api/videos?limit=100';
+  if (node) url += '&node_id=' + encodeURIComponent(node);
+
+  const res = await fetch(url);
   const videos = await res.json();
+
   const container = document.getElementById('events');
   container.innerHTML = '';
 
   for (const v of videos) {
     const div = document.createElement('div');
     div.className = 'event';
-    div.innerText = `${v.created_at} | ${v.node_id} | ${Math.round(v.filesize_bytes / 1024 / 1024 * 10) / 10} MB`;
+
+    const date = new Date(v.created_at);
+
+    div.innerHTML = `
+      <b>${date.toLocaleString()}</b><br>
+      <small>${v.node_id} | ${v.duration_seconds}s | ${fmtSize(v.filesize_bytes)}</small>
+    `;
+
     div.onclick = () => {
       document.getElementById('player').src = `/api/video/${v.id}`;
+      document.getElementById('playerTitle').innerText =
+        `${v.node_id} — ${date.toLocaleString()}`;
       document.getElementById('player').play();
     };
+
     container.appendChild(div);
   }
 }
 
-loadVideos();
-setInterval(loadVideos, 10000);
+async function refreshAll() {
+  await loadNodes();
+  await loadVideos();
+}
+
+refreshAll();
+setInterval(refreshAll, 10000);
 </script>
 </body>
 </html>
 """
-
 
 @app.get("/api/health")
 def health():
