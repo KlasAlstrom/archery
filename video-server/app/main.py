@@ -8,7 +8,7 @@ from fastapi import FastAPI, UploadFile, File, Form, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, BigInteger
 from sqlalchemy.orm import declarative_base, sessionmaker
-
+import httpx
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 VIDEO_STORAGE = Path(os.environ["VIDEO_STORAGE"])
@@ -38,6 +38,7 @@ class Node(Base):
     __tablename__ = "nodes"
 
     node_id = Column(String, primary_key=True)
+    ip_address = Column(String, nullable=True)
     last_seen = Column(DateTime, nullable=False)
     status = Column(String, nullable=False)
 
@@ -156,11 +157,11 @@ def get_video(video_id: str):
     finally:
         db.close()
 
-
 @app.post("/api/heartbeat")
 def heartbeat(
     node_id: str = Form(...),
     status: str = Form("ok"),
+    ip_address: str | None = Form(None),
     authorization: str | None = Header(default=None),
 ):
     check_token(authorization)
@@ -171,11 +172,13 @@ def heartbeat(
         if not node:
             node = Node(
                 node_id=node_id,
+                ip_address=ip_address,
                 last_seen=datetime.now(timezone.utc),
                 status=status,
             )
             db.add(node)
         else:
+            node.ip_address = ip_address
             node.last_seen = datetime.now(timezone.utc)
             node.status = status
 
@@ -184,7 +187,6 @@ def heartbeat(
         db.close()
 
     return {"status": "ok"}
-
 
 @app.get("/api/nodes")
 def list_nodes():
@@ -203,6 +205,7 @@ def list_nodes():
 
             result.append({
                 "node_id": n.node_id,
+                "ip_address": n.ip_address,
                 "status": "online" if now - last_seen < timedelta(minutes=2) else "offline",
                 "last_seen": last_seen.isoformat(),
             })
@@ -397,6 +400,62 @@ setInterval(refreshAll, 10000);
 </body>
 </html>
 """
+
+@app.post("/api/trigger-all")
+async def trigger_all():
+    db = SessionLocal()
+    try:
+        now = datetime.now(timezone.utc)
+        nodes = db.query(Node).all()
+
+        targets = []
+
+        for n in nodes:
+            if not n.ip_address:
+                continue
+
+            last_seen = n.last_seen
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+
+            if now - last_seen < timedelta(minutes=2):
+                targets.append({
+                    "node_id": n.node_id,
+                    "ip_address": n.ip_address,
+                    "url": f"http://{n.ip_address}:8080/trigger",
+                })
+    finally:
+        db.close()
+
+    results = []
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        for target in targets:
+            try:
+                response = await client.post(target["url"])
+
+                results.append({
+                    "node_id": target["node_id"],
+                    "ip_address": target["ip_address"],
+                    "ok": response.status_code == 200,
+                    "status_code": response.status_code,
+                    "response": response.json() if response.headers.get("content-type", "").startswith("application/json") else None,
+                })
+
+            except Exception as e:
+                results.append({
+                    "node_id": target["node_id"],
+                    "ip_address": target["ip_address"],
+                    "ok": False,
+                    "error": str(e),
+                })
+
+    return {
+        "status": "ok",
+        "triggered": len(results),
+        "results": results,
+    }
+
 
 @app.get("/api/health")
 def health():

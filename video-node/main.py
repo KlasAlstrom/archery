@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 
 from fastapi import FastAPI, BackgroundTasks
 import uvicorn
-
+import socket
 
 CONFIG_PATH = "config.yaml"
 
@@ -40,9 +40,18 @@ trigger_queue: asyncio.Queue = asyncio.Queue()
 ffmpeg_process: subprocess.Popen | None = None
 
 
+def get_local_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
 async def heartbeat_worker():
     headers = {"Authorization": f"Bearer {TOKEN}"}
-
     heartbeat_url = UPLOAD_URL.replace("/api/upload", "/api/heartbeat")
 
     while True:
@@ -51,6 +60,7 @@ async def heartbeat_worker():
                 data = aiohttp.FormData()
                 data.add_field("node_id", NODE_ID)
                 data.add_field("status", "ok")
+                data.add_field("ip_address", get_local_ip())
 
                 await session.post(
                     heartbeat_url,
