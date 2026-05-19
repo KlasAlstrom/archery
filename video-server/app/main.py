@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import create_engine, Column, String, DateTime, Integer, BigInteger
 from sqlalchemy.orm import declarative_base, sessionmaker
 import httpx
+import subprocess
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 VIDEO_STORAGE = Path(os.environ["VIDEO_STORAGE"])
@@ -32,7 +33,7 @@ class Video(Base):
     duration_seconds = Column(Integer, nullable=False)
     filesize_bytes = Column(BigInteger, nullable=False)
     storage_path = Column(String, nullable=False)
-
+    thumbnail_path = Column(String, nullable=True)
 
 class Node(Base):
     __tablename__ = "nodes"
@@ -46,6 +47,22 @@ def utc_iso(dt):
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=timezone.utc)
     return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+def generate_thumbnail(video_path: Path, thumb_path: Path):
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", str(video_path),
+        "-ss", "00:00:02",
+        "-frames:v", "1",
+        "-q:v", "2",
+        str(thumb_path),
+    ]
+
+    result = subprocess.run(cmd)
+
+    return result.returncode == 0
 
 @app.on_event("startup")
 def startup():
@@ -86,6 +103,15 @@ async def upload_video(
 
     filesize = output_path.stat().st_size
 
+    thumbnail_path = output_path.with_suffix(".jpg")
+
+    thumb_ok = generate_thumbnail(
+        output_path,
+        thumbnail_path,
+    )
+
+    thumbnail_str = str(thumbnail_path) if thumb_ok else None
+
     db = SessionLocal()
     try:
         db.add(Video(
@@ -97,6 +123,7 @@ async def upload_video(
             duration_seconds=duration,
             filesize_bytes=filesize,
             storage_path=str(output_path),
+            thumbnail_path=thumbnail_str,
         ))
         db.commit()
     finally:
@@ -248,6 +275,32 @@ def cleanup_old_videos(authorization: str | None = Header(default=None)):
     }
 
 
+@app.get("/api/thumbnail/{video_id}")
+def get_thumbnail(video_id: str):
+    db = SessionLocal()
+
+    try:
+        video = db.query(Video).filter(Video.id == video_id).first()
+
+        if not video:
+            raise HTTPException(status_code=404)
+
+        if not video.thumbnail_path:
+            raise HTTPException(status_code=404)
+
+        thumb = Path(video.thumbnail_path)
+
+        if not thumb.exists():
+            raise HTTPException(status_code=404)
+
+        return FileResponse(
+            thumb,
+            media_type="image/jpeg",
+        )
+
+    finally:
+        db.close()
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return """
@@ -383,10 +436,23 @@ async function loadVideos(resetOffset = false) {
     const localTime = fmtLocalTime(v.created_at);
 
     div.innerHTML = `
-    <b>${localTime}</b><br>
-    <small>${v.node_id} | ${v.duration_seconds}s | ${fmtSize(v.filesize_bytes)}</small>
-    `;
+    <div style="display:flex; gap:10px;">
+        <img
+        src="/api/thumbnail/${v.id}"
+        style="width:120px; height:68px; object-fit:cover; background:#000;"
+        >
 
+        <div>
+        <b>${localTime}</b><br>
+        <small>
+            ${v.node_id} |
+            ${v.duration_seconds}s |
+            ${fmtSize(v.filesize_bytes)}
+        </small>
+        </div>
+    </div>
+    `;
+    
     div.onclick = () => {
     document.getElementById('player').src = `/api/video/${v.id}`;
     document.getElementById('playerTitle').innerText =
