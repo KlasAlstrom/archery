@@ -8,10 +8,11 @@ import subprocess
 from pathlib import Path
 from datetime import datetime, timezone
 
+from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
 from fastapi import FastAPI, BackgroundTasks
 import uvicorn
 import socket
-from fastapi import Request
+#from fastapi import Request
 
 CONFIG_PATH = "config.yaml"
 
@@ -78,6 +79,17 @@ def ensure_dirs():
     SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
 
+    for f in SEGMENT_DIR.glob("segment_*.ts"):
+        f.unlink(missing_ok=True)
+
+    for f in CLIP_DIR.glob("*.txt"):
+        f.unlink(missing_ok=True)
+
+
+def buffer_ready():
+    safe_files = get_segments_by_mtime()[:-1]
+    return len(safe_files) >= PRE_SECONDS + 2
+
 
 def start_ffmpeg():
     global ffmpeg_process
@@ -120,11 +132,33 @@ async def monitor_ffmpeg():
     global ffmpeg_process
 
     while True:
-        if ffmpeg_process is None or ffmpeg_process.poll() is not None:
+        ffmpeg_dead = ffmpeg_process is None or ffmpeg_process.poll() is not None
+
+        if ffmpeg_dead:
             print("FFmpeg not running, restarting...")
             start_ffmpeg()
 
-        await asyncio.sleep(2)
+        elif not recorder_is_healthy():
+            print("Recorder unhealthy, restarting FFmpeg...")
+            stop_ffmpeg()
+            start_ffmpeg()
+
+        await asyncio.sleep(3)
+
+
+def stop_ffmpeg():
+    global ffmpeg_process
+
+    if ffmpeg_process is None:
+        return
+
+    try:
+        ffmpeg_process.terminate()
+        ffmpeg_process.wait(timeout=5)
+    except Exception:
+        ffmpeg_process.kill()
+
+    ffmpeg_process = None
 
 
 def get_segments_by_mtime():
@@ -136,8 +170,24 @@ def get_segments_by_mtime():
 
 def select_recent_segments(seconds: int):
     files = get_segments_by_mtime()
+
+    # Newest file may still be written by FFmpeg, so ignore it.
+    safe_files = files[:-1]
+
     needed = seconds // SEGMENT_SECONDS + 2
-    return files[-needed:]
+    return safe_files[-needed:]
+
+
+def recorder_is_healthy():
+    files = get_segments_by_mtime()
+
+    if not files:
+        return False
+
+    newest = files[-1]
+    age = time.time() - newest.stat().st_mtime
+
+    return age < 3
 
 
 async def build_clip(event_id: str) -> Path:
@@ -261,6 +311,9 @@ async def trigger(request: Request):
     event_id = body.get("event_id") or str(uuid.uuid4())
     created_at = body.get("created_at") or datetime.now(timezone.utc).isoformat()
 
+    if not buffer_ready():
+        raise HTTPException(status_code=503, detail="Video buffer not ready")
+
     await trigger_queue.put({
         "event_id": event_id,
         "created_at": created_at,
@@ -276,11 +329,13 @@ async def trigger(request: Request):
 @app.get("/health")
 async def health():
     ffmpeg_ok = ffmpeg_process is not None and ffmpeg_process.poll() is None
+    recorder_ok = recorder_is_healthy()
 
     return {
-        "status": "ok" if ffmpeg_ok else "degraded",
+        "status": "ok" if ffmpeg_ok and recorder_ok else "degraded",
         "node_id": NODE_ID,
         "ffmpeg_running": ffmpeg_ok,
+        "recorder_healthy": recorder_ok,
         "queue_size": trigger_queue.qsize(),
     }
 
