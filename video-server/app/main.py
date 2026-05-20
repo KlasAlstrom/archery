@@ -15,6 +15,7 @@ import logging
 DATABASE_URL = os.environ["DATABASE_URL"]
 VIDEO_STORAGE = Path(os.environ["VIDEO_STORAGE"])
 NODE_TOKEN = os.environ["NODE_TOKEN"]
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
@@ -89,6 +90,11 @@ async def upload_video(
     authorization: str | None = Header(default=None),
 ):
     check_token(authorization)
+    if not video.filename.lower().endswith(".mp4"):
+        raise HTTPException(status_code=400, detail="Only MP4 files are allowed")
+
+    if video.content_type != "video/mp4":
+        raise HTTPException(status_code=400, detail="Invalid content type")
 
     video_id = str(uuid.uuid4())
 
@@ -101,11 +107,21 @@ async def upload_video(
     day_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = day_dir / f"{video_id}.mp4"
+    tmp_path = day_dir / f"{video_id}.uploading"
 
-    with output_path.open("wb") as f:
+    with tmp_path.open("wb") as f:
         shutil.copyfileobj(video.file, f)
 
+    tmp_path.rename(output_path)
+
     filesize = output_path.stat().st_size
+
+    if filesize == 0:
+        output_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail="Empty video file")
+    if filesize > MAX_UPLOAD_BYTES:
+        output_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=413, detail="Video too large")
 
     thumbnail_path = output_path.with_suffix(".jpg")
 
