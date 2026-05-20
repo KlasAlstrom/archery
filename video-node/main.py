@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from fastapi import FastAPI, BackgroundTasks
 import uvicorn
 import socket
+from fastapi import Request
 
 CONFIG_PATH = "config.yaml"
 
@@ -249,9 +250,16 @@ async def trigger_worker():
 
 
 @app.post("/trigger")
-async def trigger():
-    event_id = str(uuid.uuid4())
-    created_at = datetime.now(timezone.utc).isoformat()
+async def trigger(request: Request):
+    body = {}
+
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+
+    event_id = body.get("event_id") or str(uuid.uuid4())
+    created_at = body.get("created_at") or datetime.now(timezone.utc).isoformat()
 
     await trigger_queue.put({
         "event_id": event_id,

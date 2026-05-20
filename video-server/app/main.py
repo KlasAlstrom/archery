@@ -436,23 +436,26 @@ async function loadVideos(resetOffset = false) {
     const localTime = fmtLocalTime(v.created_at);
 
     div.innerHTML = `
-    <div style="display:flex; gap:10px;">
+      <div style="display:flex; gap:10px;">
         <img
-        src="/api/thumbnail/${v.id}"
-        style="width:120px; height:68px; object-fit:cover; background:#000;"
+          src="/api/thumbnail/${v.id}"
+          style="width:120px; height:68px; object-fit:cover; background:#000;"
         >
-
-        <div>
-        <b>${localTime}</b><br>
-        <small>
+    
+        <div style="flex:1;">
+          <b>${localTime}</b><br>
+          <small>
             ${v.node_id} |
             ${v.duration_seconds}s |
             ${fmtSize(v.filesize_bytes)}
-        </small>
+          </small><br>
+          <button onclick="deleteEvent(event, '${v.event_id}')">
+            Delete trigger
+          </button>
         </div>
-    </div>
-    `;
-    
+      </div>
+    `;    
+
     div.onclick = () => {
     document.getElementById('player').src = `/api/video/${v.id}`;
     document.getElementById('playerTitle').innerText =
@@ -513,6 +516,24 @@ async function triggerAllNodes() {
   }
 }
 
+async function deleteEvent(e, eventId) {
+  e.stopPropagation();
+
+  if (!confirm('Delete all clips from this trigger?')) {
+    return;
+  }
+
+  const res = await fetch(`/api/events/${eventId}`, {
+    method: 'DELETE'
+  });
+
+  const data = await res.json();
+
+  alert(`Deleted ${data.deleted} clip(s)`);
+
+  await loadVideos(true);
+}
+
 const FPS = 30;
 
 function slowMotion() {
@@ -551,6 +572,9 @@ setInterval(refreshAll, 10000);
 
 @app.post("/api/trigger-all")
 async def trigger_all():
+    shared_event_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+
     db = SessionLocal()
     try:
         now = datetime.now(timezone.utc)
@@ -580,14 +604,19 @@ async def trigger_all():
     async with httpx.AsyncClient(timeout=5.0) as client:
         for target in targets:
             try:
-                response = await client.post(target["url"])
+                response = await client.post(
+                    target["url"],
+                    json={
+                        "event_id": shared_event_id,
+                        "created_at": created_at,
+                    },
+                )
 
                 results.append({
                     "node_id": target["node_id"],
                     "ip_address": target["ip_address"],
                     "ok": response.status_code == 200,
                     "status_code": response.status_code,
-                    "response": response.json() if response.headers.get("content-type", "").startswith("application/json") else None,
                 })
 
             except Exception as e:
@@ -600,10 +629,42 @@ async def trigger_all():
 
     return {
         "status": "ok",
+        "event_id": shared_event_id,
         "triggered": len(results),
         "results": results,
     }
 
+@app.delete("/api/events/{event_id}")
+def delete_event(event_id: str):
+    db = SessionLocal()
+    deleted = 0
+
+    try:
+        videos = db.query(Video).filter(Video.event_id == event_id).all()
+
+        for video in videos:
+            video_path = Path(video.storage_path)
+            thumb_path = Path(video.thumbnail_path) if video.thumbnail_path else None
+
+            if video_path.exists():
+                video_path.unlink()
+
+            if thumb_path and thumb_path.exists():
+                thumb_path.unlink()
+
+            db.delete(video)
+            deleted += 1
+
+        db.commit()
+
+        return {
+            "status": "ok",
+            "event_id": event_id,
+            "deleted": deleted,
+        }
+
+    finally:
+        db.close()
 
 @app.get("/api/health")
 def health():
