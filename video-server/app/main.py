@@ -10,6 +10,7 @@ from sqlalchemy import create_engine, Column, String, DateTime, Integer, BigInte
 from sqlalchemy.orm import declarative_base, sessionmaker
 import httpx
 import subprocess
+import logging
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 VIDEO_STORAGE = Path(os.environ["VIDEO_STORAGE"])
@@ -17,6 +18,9 @@ NODE_TOKEN = os.environ["NODE_TOKEN"]
 
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(bind=engine)
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("video-server")
 
 Base = declarative_base()
 app = FastAPI()
@@ -109,6 +113,8 @@ async def upload_video(
         output_path,
         thumbnail_path,
     )
+    if not thumb_ok:
+        logger.warning("thumbnail_failed video_id=%s path=%s", video_id, output_path)    
 
     thumbnail_str = str(thumbnail_path) if thumb_ok else None
 
@@ -126,6 +132,13 @@ async def upload_video(
             thumbnail_path=thumbnail_str,
         ))
         db.commit()
+        logger.info(
+            "upload_ok video_id=%s event_id=%s node_id=%s size=%s",
+            video_id,
+            event_id,
+            node_id,
+            filesize,
+        )        
     finally:
         db.close()
 
@@ -268,6 +281,8 @@ def cleanup_old_videos(authorization: str | None = Header(default=None)):
         db.commit()
     finally:
         db.close()
+
+    logger.info("cleanup_deleted count=%s", deleted)
 
     return {
         "status": "ok",
@@ -626,6 +641,12 @@ async def trigger_all():
                     "ok": False,
                     "error": str(e),
                 })
+    logger.info(
+        "trigger_all event_id=%s targets=%s ok=%s",
+        shared_event_id,
+        len(results),
+        sum(1 for r in results if r.get("ok")),
+    )
 
     return {
         "status": "ok",
@@ -656,6 +677,11 @@ def delete_event(event_id: str):
             deleted += 1
 
         db.commit()
+        logger.info(
+            "delete_event event_id=%s deleted=%s",
+            event_id,
+            deleted,
+        )
 
         return {
             "status": "ok",

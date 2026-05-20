@@ -130,3 +130,7 @@ du -sh /srv/video-storage
 List stored videos:
 
 find /srv/video-storage -name "*.mp4" | head
+
+
+View logs for server
+docker compose logs -f app
