@@ -12,7 +12,7 @@ from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
 from fastapi import FastAPI, BackgroundTasks
 import uvicorn
 import socket
-#from fastapi import Request
+from contextlib import asynccontextmanager
 
 CONFIG_PATH = "config.yaml"
 
@@ -36,7 +36,29 @@ TOKEN = cfg["server"]["token"]
 
 SEGMENT_PATTERN = SEGMENT_DIR / "segment_%03d.ts"
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    ensure_dirs()
+    start_ffmpeg()
+
+    monitor_task = asyncio.create_task(monitor_ffmpeg())
+    trigger_task = asyncio.create_task(trigger_worker())
+    heartbeat_task = asyncio.create_task(heartbeat_worker())
+
+    try:
+        yield
+
+    finally:
+        print("Shutting down video node...")
+
+        monitor_task.cancel()
+        trigger_task.cancel()
+        heartbeat_task.cancel()
+
+        stop_ffmpeg()
+
+
+app = FastAPI(lifespan = lifespan)
 
 trigger_queue: asyncio.Queue = asyncio.Queue()
 ffmpeg_process: subprocess.Popen | None = None
@@ -340,14 +362,20 @@ async def health():
     }
 
 
-@app.on_event("startup")
-async def startup():
-    ensure_dirs()
-    start_ffmpeg()
 
-    asyncio.create_task(monitor_ffmpeg())
-    asyncio.create_task(trigger_worker())
-    asyncio.create_task(heartbeat_worker())
+# @app.on_event("shutdown")
+# async def shutdown():
+#     print("Shutting down video node...")
+#     stop_ffmpeg()
+
+# @app.on_event("startup")
+# async def startup():
+#     ensure_dirs()
+#     start_ffmpeg()
+
+#     asyncio.create_task(monitor_ffmpeg())
+#     asyncio.create_task(trigger_worker())
+#     asyncio.create_task(heartbeat_worker())
 
 if __name__ == "__main__":
     uvicorn.run(

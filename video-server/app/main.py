@@ -446,55 +446,66 @@ async function loadVideos(resetOffset = false) {
   if (resetOffset) offset = 0;
 
   const node = document.getElementById('nodeFilter').value;
-  let url = `/api/videos?limit=${limit}&offset=${offset}`;
+  let url = `/api/events?limit=${limit}&offset=${offset}`;
   if (node) url += '&node_id=' + encodeURIComponent(node);
 
   const res = await fetch(url);
   const data = await res.json();
-  const videos = data.items;
+  const events = data.items;
 
   const container = document.getElementById('events');
   container.innerHTML = '';
 
   const info = document.createElement('div');
-  info.innerHTML = `<small>Showing ${offset + 1}-${Math.min(offset + limit, data.total)} of ${data.total}</small>`;
+  info.innerHTML = `<small>Showing ${offset + 1}-${Math.min(offset + limit, data.total)} of ${data.total} trigger events</small>`;
   container.appendChild(info);
 
-  for (const v of videos) {
-    const div = document.createElement('div');
-    div.className = 'event';
+  for (const ev of events) {
+    const eventDiv = document.createElement('div');
+    eventDiv.className = 'event';
 
-    const localTime = fmtLocalTime(v.created_at);
+    const localTime = fmtLocalTime(ev.created_at);
 
-    div.innerHTML = `
-      <div style="display:flex; gap:10px;">
-        <img
-          src="/api/thumbnail/${v.id}"
-          style="width:120px; height:68px; object-fit:cover; background:#000;"
-        >
-    
-        <div style="flex:1;">
-          <b>${localTime}</b><br>
-          <small>
-            ${v.node_id} |
-            ${v.duration_seconds}s |
-            ${fmtSize(v.filesize_bytes)}
-          </small><br>
-          <button onclick="deleteEvent(event, '${v.event_id}')">
-            Delete trigger
-          </button>
+    let clipsHtml = '';
+
+    for (const clip of ev.clips) {
+      clipsHtml += `
+        <div style="display:flex; gap:10px; margin-top:8px; padding:6px; background:#f4f4f4;">
+          <img
+            src="/api/thumbnail/${clip.id}"
+            style="width:120px; height:68px; object-fit:cover; background:#000;"
+            onclick="playClip(event, '${clip.id}', '${clip.node_id}', '${localTime}')"
+          >
+
+          <div>
+            <b>${clip.node_id}</b><br>
+            <small>
+              ${clip.duration_seconds}s |
+              ${fmtSize(clip.filesize_bytes)}
+            </small><br>
+            <button onclick="playClip(event, '${clip.id}', '${clip.node_id}', '${localTime}')">
+              Play
+            </button>
+          </div>
         </div>
+      `;
+    }
+
+    eventDiv.innerHTML = `
+      <div>
+        <b>${localTime}</b><br>
+        <small>${ev.clips.length} clip(s) from this trigger</small><br>
+        <button onclick="deleteEvent(event, '${ev.event_id}')">
+          Delete trigger
+        </button>
       </div>
-    `;    
 
-    div.onclick = () => {
-    document.getElementById('player').src = `/api/video/${v.id}`;
-    document.getElementById('playerTitle').innerText =
-        `${v.node_id} — ${localTime}`;
-    document.getElementById('player').play();
-    };    
+      <div style="margin-top:8px;">
+        ${clipsHtml}
+      </div>
+    `;
 
-    container.appendChild(div);
+    container.appendChild(eventDiv);
   }
 
   const nav = document.createElement('div');
@@ -519,6 +530,18 @@ async function loadVideos(resetOffset = false) {
   nav.appendChild(prev);
   nav.appendChild(next);
   container.appendChild(nav);
+}
+
+function playClip(e, videoId, nodeId, localTime) {
+  e.stopPropagation();
+
+  const player = document.getElementById('player');
+  player.src = `/api/video/${videoId}`;
+
+  document.getElementById('playerTitle').innerText =
+    `${nodeId} — ${localTime}`;
+
+  player.play();
 }
 
 async function triggerAllNodes() {
@@ -670,6 +693,61 @@ async def trigger_all():
         "triggered": len(results),
         "results": results,
     }
+
+@app.get("/api/events")
+def list_events(
+    limit: int = 100,
+    offset: int = 0,
+    node_id: str | None = None,
+):
+    db = SessionLocal()
+    try:
+        q = db.query(Video).order_by(Video.created_at.desc())
+
+        if node_id:
+            q = q.filter(Video.node_id == node_id)
+
+        rows = q.all()
+
+        grouped = {}
+
+        for v in rows:
+            if v.event_id not in grouped:
+                grouped[v.event_id] = {
+                    "event_id": v.event_id,
+                    "created_at": v.created_at,
+                    "clips": [],
+                }
+
+            grouped[v.event_id]["clips"].append({
+                "id": v.id,
+                "node_id": v.node_id,
+                "created_at": utc_iso(v.created_at),
+                "duration_seconds": v.duration_seconds,
+                "filesize_bytes": v.filesize_bytes,
+            })
+
+            if v.created_at < grouped[v.event_id]["created_at"]:
+                grouped[v.event_id]["created_at"] = v.created_at
+
+        events = list(grouped.values())
+        events.sort(key=lambda e: e["created_at"], reverse=True)
+
+        total = len(events)
+        page = events[offset:offset + limit]
+
+        for e in page:
+            e["created_at"] = utc_iso(e["created_at"])
+
+        return {
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "items": page,
+        }
+
+    finally:
+        db.close()
 
 @app.delete("/api/events/{event_id}")
 def delete_event(event_id: str):
