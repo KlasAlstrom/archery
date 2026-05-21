@@ -11,6 +11,7 @@ from sqlalchemy.orm import declarative_base, sessionmaker
 import httpx
 import subprocess
 import logging
+import shutil
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 VIDEO_STORAGE = Path(os.environ["VIDEO_STORAGE"])
@@ -785,6 +786,127 @@ def delete_event(event_id: str):
 
     finally:
         db.close()
+
+
+@app.get("/api/status")
+def server_status():
+    db = SessionLocal()
+    try:
+        total, used, free = shutil.disk_usage(VIDEO_STORAGE)
+
+        now = datetime.now(timezone.utc)
+        nodes = db.query(Node).order_by(Node.node_id).all()
+        latest_video = db.query(Video).order_by(Video.uploaded_at.desc()).first()
+        video_count = db.query(Video).count()
+
+        node_items = []
+
+        for n in nodes:
+            last_seen = n.last_seen
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+
+            node_items.append({
+                "node_id": n.node_id,
+                "ip_address": n.ip_address,
+                "status": "online" if now - last_seen < timedelta(minutes=2) else "offline",
+                "last_seen": utc_iso(last_seen),
+            })
+
+        return {
+            "storage": {
+                "total_bytes": total,
+                "used_bytes": used,
+                "free_bytes": free,
+            },
+            "nodes": node_items,
+            "video_count": video_count,
+            "latest_upload": utc_iso(latest_video.uploaded_at) if latest_video else None,
+        }
+
+    finally:
+        db.close()
+
+
+@app.get("/status", response_class=HTMLResponse)
+def status_page():
+    return """
+<!doctype html>
+<html>
+<head>
+  <title>System Status</title>
+  <style>
+    body { font-family: sans-serif; margin: 20px; background: #f6f6f6; }
+    .panel { background: white; padding: 14px; border-radius: 8px; margin-bottom: 16px; }
+    .online { color: green; font-weight: bold; }
+    .offline { color: red; font-weight: bold; }
+  </style>
+</head>
+<body>
+  <h1>System Status</h1>
+  <p><a href="/status">System status</a></p>
+  <p><a href="/">Back to videos</a></p>
+
+  <div class="panel">
+    <h2>Storage</h2>
+    <div id="storage">Loading...</div>
+  </div>
+
+  <div class="panel">
+    <h2>Nodes</h2>
+    <div id="nodes">Loading...</div>
+  </div>
+
+  <div class="panel">
+    <h2>Videos</h2>
+    <div id="videos">Loading...</div>
+  </div>
+
+<script>
+function fmtSize(bytes) {
+  return Math.round(bytes / 1024 / 1024 / 1024 * 10) / 10 + " GB";
+}
+
+function fmtLocalTime(isoString) {
+  if (!isoString) return "None";
+  return new Date(isoString).toLocaleString();
+}
+
+async function loadStatus() {
+  const res = await fetch('/api/status');
+  const s = await res.json();
+
+  const usedPercent = Math.round(s.storage.used_bytes / s.storage.total_bytes * 1000) / 10;
+
+  document.getElementById('storage').innerHTML = `
+    Used: <b>${fmtSize(s.storage.used_bytes)}</b><br>
+    Free: <b>${fmtSize(s.storage.free_bytes)}</b><br>
+    Total: <b>${fmtSize(s.storage.total_bytes)}</b><br>
+    Used percent: <b>${usedPercent}%</b>
+  `;
+
+  document.getElementById('nodes').innerHTML = s.nodes.map(n => `
+    <div>
+      <b>${n.node_id}</b>
+      <span class="${n.status}">${n.status}</span><br>
+      IP: ${n.ip_address || "-"}<br>
+      Last seen: ${fmtLocalTime(n.last_seen)}
+    </div><br>
+  `).join('');
+
+  document.getElementById('videos').innerHTML = `
+    Stored clips: <b>${s.video_count}</b><br>
+    Latest upload: <b>${fmtLocalTime(s.latest_upload)}</b>
+  `;
+}
+
+loadStatus();
+setInterval(loadStatus, 10000);
+</script>
+</body>
+</html>
+"""
+
 
 @app.get("/api/health")
 def health():
