@@ -13,13 +13,17 @@ from fastapi import FastAPI, BackgroundTasks
 import uvicorn
 import socket
 from contextlib import asynccontextmanager
+import os
 
 CONFIG_PATH = "config.yaml"
 
 with open(CONFIG_PATH, "r") as f:
     cfg = yaml.safe_load(f)
 
-NODE_ID = cfg["node_id"]
+NODE_ID = os.environ.get(
+    "NODE_ID",
+    cfg.get("node_id", "node-unknown")
+)
 
 BASE_DIR = Path(cfg["buffer"]["base_dir"])
 SEGMENT_DIR = BASE_DIR / "segments"

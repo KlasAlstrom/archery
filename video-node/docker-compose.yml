@@ -1,0 +1,18 @@
+services:
+  video-node:
+    build: .
+    container_name: video-node
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+
+    devices:
+      - /dev/video0:/dev/video0
+
+    volumes:
+      - /dev/shm/video-node:/dev/shm/video-node
+      - ./config.yaml:/app/config.yaml:ro
+
+    environment:
+      - PYTHONUNBUFFERED=1
+      - NODE_ID=node-01

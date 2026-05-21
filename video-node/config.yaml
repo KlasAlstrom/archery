@@ -1,12 +1,9 @@
-node_id: node-01
-
 camera:
   device: /dev/video0
   width: 1280
   height: 720
   fps: 30
   input_format: mjpeg
-  encode_mode: software
 
 buffer:
   base_dir: /dev/shm/video-node
@@ -19,7 +16,7 @@ trigger:
   port: 8080
 
 server:
-  upload_url: http://192.168.2.69/api/upload
+  upload_url: http://192.168.2.82/api/upload
   token: archery-video-2026
 
 clip:
