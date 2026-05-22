@@ -16,7 +16,7 @@ trigger:
   port: 8080
 
 server:
-  upload_url: http://192.168.2.82/api/upload
+  upload_url: http://192.168.60.1/api/upload
   token: archery-video-2026
 
 clip:
