@@ -347,23 +347,155 @@ def index():
 
     <span id="triggerStatus" style="margin-left: 10px;"></span>
   </div>
-    
+
   <style>
-    body { font-family: sans-serif; margin: 20px; background: #f6f6f6; }
-    h1 { margin-bottom: 10px; }
-    .layout { display: grid; grid-template-columns: 460px 1fr; gap: 20px; }
-    .panel { background: white; padding: 14px; border-radius: 8px; }
-    .event { padding: 10px; border-bottom: 1px solid #ddd; cursor: pointer; }
-    .event:hover { background: #eee; }
-    .event small { color: #555; }
-    video { width: 100%; max-height: 75vh; background: black; }
-    select, button { padding: 6px; margin-right: 6px; }
-    .online { color: green; font-weight: bold; }
-    .offline { color: red; font-weight: bold; }
-  </style>
+  body {
+    font-family: system-ui, sans-serif;
+    margin: 0;
+    background: #f6f6f6;
+  }
+
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: white;
+    padding: 12px;
+    border-bottom: 1px solid #ddd;
+  }
+
+  h1, h2 {
+    margin: 0 0 10px 0;
+  }
+
+  .top-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  button, select {
+    font-size: 16px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid #bbb;
+    background: white;
+  }
+
+  button {
+    cursor: pointer;
+  }
+
+  .primary {
+    background: #222;
+    color: white;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 460px 1fr;
+    gap: 16px;
+    padding: 16px;
+  }
+
+  .panel {
+    background: white;
+    padding: 14px;
+    border-radius: 12px;
+  }
+
+  .event {
+    padding: 12px;
+    border-bottom: 1px solid #ddd;
+  }
+
+  .clip {
+    display: flex;
+    gap: 10px;
+    margin-top: 8px;
+    padding: 8px;
+    background: #f4f4f4;
+    border-radius: 10px;
+  }
+
+  .clip img {
+    width: 120px;
+    height: 68px;
+    object-fit: cover;
+    background: #000;
+    border-radius: 6px;
+  }
+
+  video {
+    width: 100%;
+    max-height: 75vh;
+    background: black;
+    border-radius: 10px;
+  }
+
+  .player-controls {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-top: 10px;
+  }
+
+  .online { color: green; font-weight: bold; }
+  .offline { color: red; font-weight: bold; }
+
+  @media (max-width: 800px) {
+    .layout {
+      display: flex;
+      flex-direction: column;
+      padding: 10px;
+    }
+
+    .player-panel {
+      order: -1;
+    }
+
+    .clip img {
+      width: 110px;
+      height: 62px;
+    }
+
+    button, select {
+      width: 100%;
+      font-size: 18px;
+      padding: 12px;
+    }
+
+    .top-actions {
+      flex-direction: column;
+      align-items: stretch;
+    }
+
+    .player-controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+    }
+  }
+</style>
+
 </head>
 <body>
+
+<header>
   <h1>Video Events</h1>
+
+  <div class="top-actions">
+    <button class="primary" onclick="triggerAllNodes()">
+      Trigger All Nodes
+    </button>
+
+    <a href="/status">
+      <button>System Status</button>
+    </a>
+
+    <span id="triggerStatus"></span>
+  </div>
+</header>
 
   <div class="layout">
     <div>
@@ -384,16 +516,17 @@ def index():
       </div>
     </div>
 
-    <div class="panel">
+
+    <div class="panel player-panel">
       <h2 id="playerTitle">Player</h2>
       <video id="player" controls preload="metadata"></video>
 
-      <div style="margin-top: 10px;">
-      <button onclick="slowMotion()">Slow motion</button>
-      <button onclick="normalSpeed()">Normal speed</button>
-      <button onclick="stepBack()">Frame back</button>
-      <button onclick="stepForward()">Frame forward</button>
-      </div>      
+   <div class="player-controls">
+     <button onclick="slowMotion()">Slow motion</button>
+     <button onclick="normalSpeed()">Normal speed</button>
+     <button onclick="stepBack()">Frame back</button>
+     <button onclick="stepForward()">Frame forward</button>
+   </div>
     </div>
   </div>
 
@@ -471,7 +604,7 @@ async function loadVideos(resetOffset = false) {
 
     for (const clip of ev.clips) {
       clipsHtml += `
-        <div style="display:flex; gap:10px; margin-top:8px; padding:6px; background:#f4f4f4;">
+        <div class="clip">
           <img
             src="/api/thumbnail/${clip.id}"
             style="width:120px; height:68px; object-fit:cover; background:#000;"
