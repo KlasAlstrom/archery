@@ -7,7 +7,7 @@ camera:
 
 buffer:
   base_dir: /dev/shm/video-node
-  segment_count: 10
+  segment_count: 20
   segment_seconds: 1
 
 trigger:

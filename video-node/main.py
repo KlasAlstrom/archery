@@ -14,6 +14,7 @@ import uvicorn
 import socket
 from contextlib import asynccontextmanager
 import os
+import shutil
 
 CONFIG_PATH = "config.yaml"
 
@@ -219,19 +220,34 @@ def recorder_is_healthy():
 async def build_clip(event_id: str) -> Path:
     total_seconds = PRE_SECONDS + POST_SECONDS
 
-    # Wait for post-trigger video to be written.
-    await asyncio.sleep(POST_SECONDS + 1)
+    await asyncio.sleep(POST_SECONDS + 0.5)
 
     segments = select_recent_segments(total_seconds)
 
     if len(segments) < total_seconds:
         raise RuntimeError("Not enough video segments available")
 
-    concat_file = CLIP_DIR / f"{event_id}.txt"
+    event_dir = CLIP_DIR / event_id
+    event_dir.mkdir(parents=True, exist_ok=True)
+
+    copied_segments = []
+
+    for i, segment in enumerate(segments):
+        target = event_dir / f"part_{i:03d}.ts"
+
+        # Copy segment immediately so circular buffer cannot overwrite it
+        shutil.copy2(segment, target)
+
+        if target.stat().st_size == 0:
+            raise RuntimeError(f"Copied empty segment: {segment}")
+
+        copied_segments.append(target)
+
+    concat_file = event_dir / "concat.txt"
     output_file = CLIP_DIR / f"{event_id}.mp4"
 
     with open(concat_file, "w") as f:
-        for segment in segments:
+        for segment in copied_segments:
             f.write(f"file '{segment.resolve()}'\n")
 
     cmd = [
@@ -248,7 +264,7 @@ async def build_clip(event_id: str) -> Path:
 
     result = subprocess.run(cmd)
 
-    concat_file.unlink(missing_ok=True)
+    shutil.rmtree(event_dir, ignore_errors=True)
 
     if result.returncode != 0:
         raise RuntimeError("Failed to build MP4 clip")

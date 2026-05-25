@@ -340,14 +340,6 @@ def index():
 <html>
 <head>
   <title>Video Events</title>
-  <div style="margin-bottom: 15px;">
-    <button onclick="triggerAllNodes()">
-      Trigger All Nodes
-    </button>
-
-    <span id="triggerStatus" style="margin-left: 10px;"></span>
-  </div>
-
   <style>
   body {
     font-family: system-ui, sans-serif;
@@ -694,6 +686,11 @@ async function triggerAllNodes() {
     const total = data.results.length;
 
     status.innerText = `Triggered ${ok}/${total} nodes`;
+
+    await loadVideos(true);
+    setTimeout(() => loadVideos(true), 3000);
+    setTimeout(() => loadVideos(true), 6000);
+    setTimeout(() => loadVideos(true), 9000);
 
     setTimeout(() => {
       status.innerText = '';
