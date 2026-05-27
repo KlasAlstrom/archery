@@ -15,4 +15,3 @@ services:
 
     environment:
       - PYTHONUNBUFFERED=1
-      - NODE_ID=node-01

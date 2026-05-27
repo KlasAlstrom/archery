@@ -16,16 +16,13 @@ from contextlib import asynccontextmanager
 from fastapi.responses import StreamingResponse
 import os
 import shutil
+import hashlib
 
 CONFIG_PATH = "config.yaml"
 
 with open(CONFIG_PATH, "r") as f:
     cfg = yaml.safe_load(f)
 
-NODE_ID = os.environ.get(
-    "NODE_ID",
-    cfg.get("node_id", "node-unknown")
-)
 
 BASE_DIR = Path(cfg["buffer"]["base_dir"])
 SEGMENT_DIR = BASE_DIR / "segments"
@@ -41,6 +38,21 @@ UPLOAD_URL = cfg["server"]["upload_url"]
 TOKEN = cfg["server"]["token"]
 
 SEGMENT_PATTERN = SEGMENT_DIR / "segment_%03d.ts"
+
+
+def generate_node_id():
+    try:
+        mac = open(
+            "/sys/class/net/wlan0/address",
+            "r"
+        ).read().strip()
+    except Exception:
+        mac = "00:00:00:00:00:00"
+
+    clean = mac.replace(":", "")
+    return f"Cam-{clean}"
+
+NODE_ID = generate_node_id()
 
 preview_process = None
 preview_lock = asyncio.Lock()
