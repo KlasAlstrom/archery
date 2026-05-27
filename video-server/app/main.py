@@ -485,6 +485,10 @@ def index():
       <button>System Status</button>
     </a>
 
+    <a href="/aim">
+      <button>Camera Aim</button>
+    </a>
+
     <span id="triggerStatus"></span>
   </div>
 </header>
@@ -1037,7 +1041,136 @@ setInterval(loadStatus, 10000);
 </html>
 """
 
+def get_node_or_404(node_id: str):
+    db = SessionLocal()
+    try:
+        node = db.query(Node).filter(Node.node_id == node_id).first()
+        if not node or not node.ip_address:
+            raise HTTPException(status_code=404, detail="Node not found or missing IP")
+        return {"node_id": node.node_id, "ip_address": node.ip_address}
+    finally:
+        db.close()
+
+
+@app.post("/api/nodes/{node_id}/preview/start")
+async def api_preview_start(node_id: str):
+    node = get_node_or_404(node_id)
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.post(f"http://{node['ip_address']}:8080/preview/start")
+
+    return {
+        "status": "ok",
+        "node_id": node_id,
+        "node_response": r.json(),
+    }
+
+
+@app.post("/api/nodes/{node_id}/preview/stop")
+async def api_preview_stop(node_id: str):
+    node = get_node_or_404(node_id)
+
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        r = await client.post(f"http://{node['ip_address']}:8080/preview/stop")
+
+    return {
+        "status": "ok",
+        "node_id": node_id,
+        "node_response": r.json(),
+    }
 
 @app.get("/api/health")
 def health():
     return {"status": "ok"}
+
+@app.get("/aim", response_class=HTMLResponse)
+def aim_page():
+    return """
+<!doctype html>
+<html>
+<head>
+  <title>Camera Aim</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 0; background: #f6f6f6; }
+    header { background: white; padding: 12px; border-bottom: 1px solid #ddd; }
+    .layout { display: grid; grid-template-columns: 360px 1fr; gap: 16px; padding: 16px; }
+    .panel { background: white; padding: 14px; border-radius: 12px; }
+    button { font-size: 16px; padding: 10px 12px; border-radius: 8px; margin: 4px; }
+    img { width: 100%; background: black; border-radius: 10px; }
+    .online { color: green; font-weight: bold; }
+    .offline { color: red; font-weight: bold; }
+
+    @media (max-width: 800px) {
+      .layout { display: flex; flex-direction: column; padding: 10px; }
+      button { width: 100%; font-size: 18px; padding: 12px; }
+    }
+  </style>
+</head>
+<body>
+<header>
+  <h1>Camera Aim</h1>
+  <p><a href="/">Back to videos</a></p>
+</header>
+
+<div class="layout">
+  <div class="panel">
+    <h2>Nodes</h2>
+    <div id="nodes">Loading...</div>
+  </div>
+
+  <div class="panel">
+    <h2 id="title">Preview</h2>
+    <div id="preview">Select a camera and start preview.</div>
+  </div>
+</div>
+
+<script>
+async function loadNodes() {
+  const res = await fetch('/api/nodes');
+  const nodes = await res.json();
+
+  const container = document.getElementById('nodes');
+  container.innerHTML = '';
+
+  for (const n of nodes) {
+    const div = document.createElement('div');
+    div.style.borderBottom = '1px solid #ddd';
+    div.style.padding = '8px';
+
+    div.innerHTML = `
+      <b>${n.node_id}</b>
+      <span class="${n.status}">${n.status}</span><br>
+      <small>${n.ip_address || '-'}</small><br>
+      <button onclick="startPreview('${n.node_id}', '${n.ip_address}')">Start preview</button>
+      <button onclick="stopPreview('${n.node_id}')">Stop preview</button>
+    `;
+
+    container.appendChild(div);
+  }
+}
+
+async function startPreview(nodeId, ip) {
+  document.getElementById('title').innerText = `Preview — ${nodeId}`;
+
+  await fetch(`/api/nodes/${nodeId}/preview/start`, { method: 'POST' });
+
+  document.getElementById('preview').innerHTML = `
+    <img src="http://${ip}:8080/preview?ts=${Date.now()}">
+  `;
+}
+
+async function stopPreview(nodeId) {
+  await fetch(`/api/nodes/${nodeId}/preview/stop`, { method: 'POST' });
+
+  document.getElementById('preview').innerHTML =
+    'Preview stopped. Recording mode restarted.';
+
+  document.getElementById('title').innerText = 'Preview';
+}
+
+loadNodes();
+setInterval(loadNodes, 10000);
+</script>
+</body>
+</html>
+"""

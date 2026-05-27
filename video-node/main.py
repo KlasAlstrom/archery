@@ -13,6 +13,7 @@ from fastapi import FastAPI, BackgroundTasks
 import uvicorn
 import socket
 from contextlib import asynccontextmanager
+from fastapi.responses import StreamingResponse
 import os
 import shutil
 
@@ -41,6 +42,9 @@ TOKEN = cfg["server"]["token"]
 
 SEGMENT_PATTERN = SEGMENT_DIR / "segment_%03d.ts"
 
+preview_process = None
+preview_lock = asyncio.Lock()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ensure_dirs()
@@ -60,6 +64,7 @@ async def lifespan(app: FastAPI):
         trigger_task.cancel()
         heartbeat_task.cancel()
 
+        stop_preview_process()
         stop_ffmpeg()
 
 
@@ -341,6 +346,88 @@ async def trigger_worker():
             trigger_queue.task_done()
 
 
+preview_process = None
+
+def start_preview_process():
+    global preview_process
+
+    if preview_process is not None and preview_process.poll() is None:
+        return
+
+    stop_ffmpeg()
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-f", "v4l2",
+        "-input_format", cfg["camera"]["input_format"],
+        "-video_size", f'{cfg["camera"]["width"]}x{cfg["camera"]["height"]}',
+        "-framerate", "10",
+        "-i", cfg["camera"]["device"],
+        "-vf", "scale=640:-1",
+        "-q:v", "5",
+        "-f", "mjpeg",
+        "pipe:1",
+    ]
+
+    preview_process = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        bufsize=0,
+    )
+
+    print("Preview process started")
+
+
+def stop_preview_process():
+    global preview_process
+
+    if preview_process is None:
+        return
+
+    try:
+        preview_process.terminate()
+        preview_process.wait(timeout=5)
+    except Exception:
+        preview_process.kill()
+
+    preview_process = None
+    print("Preview process stopped")
+
+
+def mjpeg_generator():
+    global preview_process
+
+    buffer = b""
+
+    while preview_process is not None and preview_process.poll() is None:
+        chunk = preview_process.stdout.read(4096)
+
+        if not chunk:
+            break
+
+        buffer += chunk
+
+        while True:
+            start = buffer.find(b"\xff\xd8")
+            end = buffer.find(b"\xff\xd9")
+
+            if start != -1 and end != -1 and end > start:
+                frame = buffer[start:end + 2]
+                buffer = buffer[end + 2:]
+
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" +
+                    frame +
+                    b"\r\n"
+                )
+            else:
+                break
+
+
 @app.post("/trigger")
 async def trigger(request: Request):
     body = {}
@@ -382,6 +469,41 @@ async def health():
     }
 
 
+@app.post("/preview/start")
+async def preview_start():
+    async with preview_lock:
+        start_preview_process()
+
+    return {"status": "preview_started"}
+
+
+@app.get("/preview")
+async def preview_stream():
+    if preview_process is None or preview_process.poll() is not None:
+        start_preview_process()
+
+    return StreamingResponse(
+        mjpeg_generator(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+    )
+
+
+@app.post("/preview/stop")
+async def preview_stop():
+    async with preview_lock:
+        stop_preview_process()
+        start_ffmpeg()
+
+    return {"status": "recording_started"}
+
+
+@app.get("/mode")
+async def mode():
+    preview_running = preview_process is not None and preview_process.poll() is None
+    return {
+        "mode": "preview" if preview_running else "recording",
+        "node_id": NODE_ID,
+    }
 
 # @app.on_event("shutdown")
 # async def shutdown():
