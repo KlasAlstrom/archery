@@ -1,258 +1,301 @@
+"""FastAPI video node for buffering, clipping, previewing, and uploading camera footage."""
+
+from __future__ import annotations
+
 import asyncio
-import os
-import uuid
-import time
-import yaml
-import aiohttp
-import subprocess
-from pathlib import Path
-from datetime import datetime, timezone
-
-from fastapi import FastAPI, BackgroundTasks, Request, HTTPException
-from fastapi import FastAPI, BackgroundTasks
-import uvicorn
-import socket
-from contextlib import asynccontextmanager
-from fastapi.responses import StreamingResponse
-import os
+import logging
 import shutil
-import hashlib
+import socket
+import subprocess
+import time
+import uuid
+from contextlib import asynccontextmanager, suppress
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, AsyncIterator, Iterator, TypedDict, cast
 
-CONFIG_PATH = "config.yaml"
+import aiohttp
+import uvicorn
+import yaml
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
-with open(CONFIG_PATH, "r") as f:
-    cfg = yaml.safe_load(f)
+CONFIG_PATH = Path("config.yaml")
+MAC_ADDRESS_PATH = Path("/sys/class/net/wlan0/address")
+HEARTBEAT_INTERVAL_SECONDS = 30
+FFMPEG_HEALTH_CHECK_INTERVAL_SECONDS = 3
+RECORDER_MAX_SEGMENT_AGE_SECONDS = 3
+UPLOAD_RETRY_INTERVAL_SECONDS = 3
+PREVIEW_FRAME_RATE = 10
+PREVIEW_SCALE = "640:-1"
 
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+
+class TriggerEvent(TypedDict):
+    event_id: str
+    created_at: str
+
+
+def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
+    with path.open("r", encoding="utf-8") as file:
+        return cast(dict[str, Any], yaml.safe_load(file))
+
+
+cfg = load_config()
 
 BASE_DIR = Path(cfg["buffer"]["base_dir"])
 SEGMENT_DIR = BASE_DIR / "segments"
 CLIP_DIR = BASE_DIR / "clips"
 
-SEGMENT_COUNT = cfg["buffer"]["segment_count"]
-SEGMENT_SECONDS = cfg["buffer"]["segment_seconds"]
-
-PRE_SECONDS = cfg["trigger"]["pre_seconds"]
-POST_SECONDS = cfg["trigger"]["post_seconds"]
-
-UPLOAD_URL = cfg["server"]["upload_url"]
-TOKEN = cfg["server"]["token"]
-
+SEGMENT_COUNT = int(cfg["buffer"]["segment_count"])
+SEGMENT_SECONDS = int(cfg["buffer"]["segment_seconds"])
+PRE_SECONDS = int(cfg["trigger"]["pre_seconds"])
+POST_SECONDS = int(cfg["trigger"]["post_seconds"])
+UPLOAD_URL = str(cfg["server"]["upload_url"])
+TOKEN = str(cfg["server"]["token"])
 SEGMENT_PATTERN = SEGMENT_DIR / "segment_%03d.ts"
 
+ffmpeg_process: subprocess.Popen[bytes] | None = None
+preview_process: subprocess.Popen[bytes] | None = None
+preview_lock = asyncio.Lock()
+trigger_queue: asyncio.Queue[TriggerEvent] = asyncio.Queue()
 
-def generate_node_id():
+
+def generate_node_id() -> str:
     try:
-        mac = open(
-            "/sys/class/net/wlan0/address",
-            "r"
-        ).read().strip()
-    except Exception:
-        mac = "00:00:00:00:00:00"
+        mac_address = MAC_ADDRESS_PATH.read_text(encoding="utf-8").strip()
+    except OSError:
+        mac_address = "00:00:00:00:00:00"
 
-    clean = mac.replace(":", "")
-    return f"Cam-{clean}"
+    return f"Cam-{mac_address.replace(':', '')}"
+
 
 NODE_ID = generate_node_id()
 
-preview_process = None
-preview_lock = asyncio.Lock()
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
-    ensure_dirs()
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    ensure_directories()
     start_ffmpeg()
 
-    monitor_task = asyncio.create_task(monitor_ffmpeg())
-    trigger_task = asyncio.create_task(trigger_worker())
-    heartbeat_task = asyncio.create_task(heartbeat_worker())
+    tasks = [
+        asyncio.create_task(monitor_ffmpeg(), name="monitor-ffmpeg"),
+        asyncio.create_task(trigger_worker(), name="trigger-worker"),
+        asyncio.create_task(heartbeat_worker(), name="heartbeat-worker"),
+    ]
 
     try:
         yield
-
     finally:
-        print("Shutting down video node...")
+        logger.info("Shutting down video node")
+        for task in tasks:
+            task.cancel()
 
-        monitor_task.cancel()
-        trigger_task.cancel()
-        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await asyncio.gather(*tasks)
 
         stop_preview_process()
         stop_ffmpeg()
 
 
-app = FastAPI(lifespan = lifespan)
-
-trigger_queue: asyncio.Queue = asyncio.Queue()
-ffmpeg_process: subprocess.Popen | None = None
+app = FastAPI(lifespan=lifespan)
 
 
-def get_local_ip():
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        ip = s.getsockname()[0]
-        s.close()
-        return ip
-    except Exception:
-        return "127.0.0.1"
-
-async def heartbeat_worker():
-    headers = {"Authorization": f"Bearer {TOKEN}"}
-    heartbeat_url = UPLOAD_URL.replace("/api/upload", "/api/heartbeat")
-
-    while True:
-        try:
-            async with aiohttp.ClientSession() as session:
-                data = aiohttp.FormData()
-                data.add_field("node_id", NODE_ID)
-                data.add_field("status", "ok")
-                data.add_field("ip_address", get_local_ip())
-
-                await session.post(
-                    heartbeat_url,
-                    data=data,
-                    headers=headers,
-                    timeout=5,
-                )
-        except Exception as e:
-            print(f"Heartbeat failed: {e}")
-
-        await asyncio.sleep(30)
-
-def ensure_dirs():
+def ensure_directories() -> None:
     SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
 
-    for f in SEGMENT_DIR.glob("segment_*.ts"):
-        f.unlink(missing_ok=True)
+    for segment in SEGMENT_DIR.glob("segment_*.ts"):
+        segment.unlink(missing_ok=True)
 
-    for f in CLIP_DIR.glob("*.txt"):
-        f.unlink(missing_ok=True)
-
-
-def buffer_ready():
-    safe_files = get_segments_by_mtime()[:-1]
-    return len(safe_files) >= PRE_SECONDS + 2
+    for stale_concat_file in CLIP_DIR.glob("*.txt"):
+        stale_concat_file.unlink(missing_ok=True)
 
 
-def start_ffmpeg():
-    global ffmpeg_process
+def get_local_ip() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        try:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+        except OSError:
+            return "127.0.0.1"
 
-    cmd = [
+
+def get_segments_by_mtime() -> list[Path]:
+    segments = [path for path in SEGMENT_DIR.glob("segment_*.ts") if path.stat().st_size > 0]
+    return sorted(segments, key=lambda path: path.stat().st_mtime)
+
+
+def get_safe_segments() -> list[Path]:
+    # The newest file may still be written by FFmpeg, so ignore it.
+    return get_segments_by_mtime()[:-1]
+
+
+def required_segment_count(seconds: int) -> int:
+    return seconds // SEGMENT_SECONDS + 2
+
+
+def buffer_ready() -> bool:
+    return len(get_safe_segments()) >= required_segment_count(PRE_SECONDS)
+
+
+def select_recent_segments(seconds: int) -> list[Path]:
+    return get_safe_segments()[-required_segment_count(seconds) :]
+
+
+def recorder_is_healthy() -> bool:
+    segments = get_segments_by_mtime()
+    if not segments:
+        return False
+
+    newest_segment_age = time.time() - segments[-1].stat().st_mtime
+    return newest_segment_age < RECORDER_MAX_SEGMENT_AGE_SECONDS
+
+
+def build_recording_command() -> list[str]:
+    camera_cfg = cfg["camera"]
+    fps = str(camera_cfg["fps"])
+
+    return [
         "ffmpeg",
         "-hide_banner",
-        "-loglevel", "warning",
-
-        "-f", "v4l2",
-        "-input_format", "mjpeg",
-        "-video_size", f'{cfg["camera"]["width"]}x{cfg["camera"]["height"]}',
-        "-framerate", str(cfg["camera"]["fps"]),
-        "-i", cfg["camera"]["device"],
-
+        "-loglevel",
+        "warning",
+        "-f",
+        "v4l2",
+        "-input_format",
+        str(camera_cfg.get("input_format", "mjpeg")),
+        "-video_size",
+        f'{camera_cfg["width"]}x{camera_cfg["height"]}',
+        "-framerate",
+        fps,
+        "-i",
+        str(camera_cfg["device"]),
         "-an",
-        "-vf", "format=yuv420p",
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-crf", "28",
-
-        "-g", str(cfg["camera"]["fps"]),
-        "-keyint_min", str(cfg["camera"]["fps"]),
-        "-sc_threshold", "0",
-
-        "-f", "segment",
-        "-segment_time", str(SEGMENT_SECONDS),
-        "-segment_wrap", str(SEGMENT_COUNT),
-        "-segment_format", "mpegts",
-        "-reset_timestamps", "1",
-
+        "-vf",
+        "format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "28",
+        "-g",
+        fps,
+        "-keyint_min",
+        fps,
+        "-sc_threshold",
+        "0",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(SEGMENT_SECONDS),
+        "-segment_wrap",
+        str(SEGMENT_COUNT),
+        "-segment_format",
+        "mpegts",
+        "-reset_timestamps",
+        "1",
         str(SEGMENT_PATTERN),
     ]
 
-    ffmpeg_process = subprocess.Popen(cmd)
-    print("FFmpeg started")
 
-
-async def monitor_ffmpeg():
+def start_ffmpeg() -> None:
     global ffmpeg_process
 
-    while True:
-        ffmpeg_dead = ffmpeg_process is None or ffmpeg_process.poll() is not None
+    if ffmpeg_process is not None and ffmpeg_process.poll() is None:
+        return
 
-        if ffmpeg_dead:
-            print("FFmpeg not running, restarting...")
-            start_ffmpeg()
-
-        elif not recorder_is_healthy():
-            print("Recorder unhealthy, restarting FFmpeg...")
-            stop_ffmpeg()
-            start_ffmpeg()
-
-        await asyncio.sleep(3)
+    ffmpeg_process = subprocess.Popen(build_recording_command())
+    logger.info("FFmpeg recorder started")
 
 
-def stop_ffmpeg():
+def stop_ffmpeg() -> None:
     global ffmpeg_process
 
     if ffmpeg_process is None:
         return
 
-    try:
-        ffmpeg_process.terminate()
-        ffmpeg_process.wait(timeout=5)
-    except Exception:
-        ffmpeg_process.kill()
-
+    terminate_process(ffmpeg_process)
     ffmpeg_process = None
 
 
-def get_segments_by_mtime():
-    files = list(SEGMENT_DIR.glob("segment_*.ts"))
-    files = [f for f in files if f.stat().st_size > 0]
-    files.sort(key=lambda p: p.stat().st_mtime)
-    return files
+def terminate_process(process: subprocess.Popen[bytes]) -> None:
+    try:
+        process.terminate()
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
 
 
-def select_recent_segments(seconds: int):
-    files = get_segments_by_mtime()
+async def monitor_ffmpeg() -> None:
+    while True:
+        ffmpeg_dead = ffmpeg_process is None or ffmpeg_process.poll() is not None
 
-    # Newest file may still be written by FFmpeg, so ignore it.
-    safe_files = files[:-1]
+        if ffmpeg_dead:
+            logger.warning("FFmpeg is not running; restarting")
+            start_ffmpeg()
+        elif not recorder_is_healthy():
+            logger.warning("Recorder is unhealthy; restarting FFmpeg")
+            stop_ffmpeg()
+            start_ffmpeg()
 
-    needed = seconds // SEGMENT_SECONDS + 2
-    return safe_files[-needed:]
+        await asyncio.sleep(FFMPEG_HEALTH_CHECK_INTERVAL_SECONDS)
 
 
-def recorder_is_healthy():
-    files = get_segments_by_mtime()
+async def heartbeat_worker() -> None:
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    heartbeat_url = UPLOAD_URL.replace("/api/upload", "/api/heartbeat")
 
-    if not files:
-        return False
+    async with aiohttp.ClientSession(headers=headers) as session:
+        while True:
+            try:
+                data = aiohttp.FormData()
+                data.add_field("node_id", NODE_ID)
+                data.add_field("status", "ok")
+                data.add_field("ip_address", get_local_ip())
 
-    newest = files[-1]
-    age = time.time() - newest.stat().st_mtime
+                async with session.post(heartbeat_url, data=data, timeout=5) as response:
+                    if response.status >= 400:
+                        logger.warning("Heartbeat failed with HTTP %s", response.status)
+            except Exception:
+                logger.exception("Heartbeat failed")
 
-    return age < 3
+            await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
 async def build_clip(event_id: str) -> Path:
     total_seconds = PRE_SECONDS + POST_SECONDS
+    expected_segments = required_segment_count(total_seconds)
 
     await asyncio.sleep(POST_SECONDS + 0.5)
 
     segments = select_recent_segments(total_seconds)
-
-    if len(segments) < total_seconds:
+    if len(segments) < expected_segments:
         raise RuntimeError("Not enough video segments available")
 
     event_dir = CLIP_DIR / event_id
-    event_dir.mkdir(parents=True, exist_ok=True)
+    output_file = CLIP_DIR / f"{event_id}.mp4"
+    concat_file = event_dir / "concat.txt"
 
-    copied_segments = []
+    try:
+        event_dir.mkdir(parents=True, exist_ok=True)
+        copied_segments = copy_segments_for_clip(segments, event_dir)
+        write_concat_file(concat_file, copied_segments)
+        run_ffmpeg_concat(concat_file, output_file)
+        return output_file
+    finally:
+        shutil.rmtree(event_dir, ignore_errors=True)
 
-    for i, segment in enumerate(segments):
-        target = event_dir / f"part_{i:03d}.ts"
 
-        # Copy segment immediately so circular buffer cannot overwrite it
+def copy_segments_for_clip(segments: list[Path], event_dir: Path) -> list[Path]:
+    copied_segments: list[Path] = []
+
+    for index, segment in enumerate(segments):
+        target = event_dir / f"part_{index:03d}.ts"
         shutil.copy2(segment, target)
 
         if target.stat().st_size == 0:
@@ -260,205 +303,205 @@ async def build_clip(event_id: str) -> Path:
 
         copied_segments.append(target)
 
-    concat_file = event_dir / "concat.txt"
-    output_file = CLIP_DIR / f"{event_id}.mp4"
+    return copied_segments
 
-    with open(concat_file, "w") as f:
-        for segment in copied_segments:
-            f.write(f"file '{segment.resolve()}'\n")
 
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "warning",
-        "-f", "concat",
-        "-safe", "0",
-        "-i", str(concat_file),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(output_file),
-    ]
+def write_concat_file(concat_file: Path, segments: list[Path]) -> None:
+    with concat_file.open("w", encoding="utf-8") as file:
+        for segment in segments:
+            file.write(f"file '{segment.resolve()}'\n")
 
-    result = subprocess.run(cmd)
 
-    shutil.rmtree(event_dir, ignore_errors=True)
+def run_ffmpeg_concat(concat_file: Path, output_file: Path) -> None:
+    result = subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_file),
+            "-c",
+            "copy",
+            "-movflags",
+            "+faststart",
+            str(output_file),
+        ],
+        check=False,
+    )
 
     if result.returncode != 0:
         raise RuntimeError("Failed to build MP4 clip")
 
-    return output_file
 
+async def upload_clip(event_id: str, clip_path: Path, created_at: str) -> bool:
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+    timeout_at = time.monotonic() + int(cfg["clip"]["max_retry_seconds"])
 
-async def upload_clip(event_id: str, clip_path: Path, created_at: str):
-    headers = {
-        "Authorization": f"Bearer {TOKEN}"
-    }
+    async with aiohttp.ClientSession(headers=headers) as session:
+        while time.monotonic() < timeout_at:
+            try:
+                if await try_upload_clip(session, event_id, clip_path, created_at):
+                    logger.info("Uploaded clip %s", event_id)
+                    return True
+            except Exception:
+                logger.exception("Upload error for clip %s", event_id)
 
-    timeout_at = time.monotonic() + cfg["clip"]["max_retry_seconds"]
-
-    while time.monotonic() < timeout_at:
-        try:
-            async with aiohttp.ClientSession() as session:
-                data = aiohttp.FormData()
-                data.add_field("node_id", NODE_ID)
-                data.add_field("event_id", event_id)
-                data.add_field("timestamp", created_at)
-                data.add_field("duration", str(PRE_SECONDS + POST_SECONDS))
-
-                with open(clip_path, "rb") as f:
-                    data.add_field(
-                        "video",
-                        f,
-                        filename=f"{event_id}.mp4",
-                        content_type="video/mp4",
-                    )
-
-                    async with session.post(
-                        UPLOAD_URL,
-                        data=data,
-                        headers=headers,
-                    ) as resp:
-                        if resp.status == 200:
-                            print(f"Uploaded {event_id}")
-                            return True
-
-                        print(f"Upload failed: HTTP {resp.status}")
-
-        except Exception as e:
-            print(f"Upload error: {e}")
-
-        await asyncio.sleep(3)
+            await asyncio.sleep(UPLOAD_RETRY_INTERVAL_SECONDS)
 
     return False
 
 
-async def trigger_worker():
+async def try_upload_clip(
+    session: aiohttp.ClientSession,
+    event_id: str,
+    clip_path: Path,
+    created_at: str,
+) -> bool:
+    data = aiohttp.FormData()
+    data.add_field("node_id", NODE_ID)
+    data.add_field("event_id", event_id)
+    data.add_field("timestamp", created_at)
+    data.add_field("duration", str(PRE_SECONDS + POST_SECONDS))
+
+    with clip_path.open("rb") as file:
+        data.add_field(
+            "video",
+            file,
+            filename=f"{event_id}.mp4",
+            content_type="video/mp4",
+        )
+
+        async with session.post(UPLOAD_URL, data=data) as response:
+            if response.status == 200:
+                return True
+
+            logger.warning("Upload failed for %s with HTTP %s", event_id, response.status)
+            return False
+
+
+async def trigger_worker() -> None:
     while True:
         event = await trigger_queue.get()
 
-        event_id = event["event_id"]
-        created_at = event["created_at"]
-
         try:
-            print(f"Building clip {event_id}")
+            event_id = event["event_id"]
+            logger.info("Building clip %s", event_id)
             clip = await build_clip(event_id)
 
-            print(f"Uploading clip {event_id}")
-            ok = await upload_clip(event_id, clip, created_at)
-
-            if not ok:
-                print(f"Dropping clip after failed upload: {event_id}")
+            logger.info("Uploading clip %s", event_id)
+            uploaded = await upload_clip(event_id, clip, event["created_at"])
+            if not uploaded:
+                logger.warning("Dropping clip after failed upload: %s", event_id)
 
             clip.unlink(missing_ok=True)
-
-        except Exception as e:
-            print(f"Event failed {event_id}: {e}")
-
+        except Exception:
+            logger.exception("Event failed: %s", event)
         finally:
             trigger_queue.task_done()
 
 
-preview_process = None
+def build_preview_command() -> list[str]:
+    camera_cfg = cfg["camera"]
 
-def start_preview_process():
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "warning",
+        "-f",
+        "v4l2",
+        "-input_format",
+        str(camera_cfg.get("input_format", "mjpeg")),
+        "-video_size",
+        f'{camera_cfg["width"]}x{camera_cfg["height"]}',
+        "-framerate",
+        str(PREVIEW_FRAME_RATE),
+        "-i",
+        str(camera_cfg["device"]),
+        "-vf",
+        f"scale={PREVIEW_SCALE}",
+        "-q:v",
+        "5",
+        "-f",
+        "mjpeg",
+        "pipe:1",
+    ]
+
+
+def start_preview_process() -> None:
     global preview_process
 
     if preview_process is not None and preview_process.poll() is None:
         return
 
     stop_ffmpeg()
-
-    cmd = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "warning",
-        "-f", "v4l2",
-        "-input_format", cfg["camera"]["input_format"],
-        "-video_size", f'{cfg["camera"]["width"]}x{cfg["camera"]["height"]}',
-        "-framerate", "10",
-        "-i", cfg["camera"]["device"],
-        "-vf", "scale=640:-1",
-        "-q:v", "5",
-        "-f", "mjpeg",
-        "pipe:1",
-    ]
-
     preview_process = subprocess.Popen(
-        cmd,
+        build_preview_command(),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         bufsize=0,
     )
+    logger.info("Preview process started")
 
-    print("Preview process started")
 
-
-def stop_preview_process():
+def stop_preview_process() -> None:
     global preview_process
 
     if preview_process is None:
         return
 
-    try:
-        preview_process.terminate()
-        preview_process.wait(timeout=5)
-    except Exception:
-        preview_process.kill()
-
+    terminate_process(preview_process)
     preview_process = None
-    print("Preview process stopped")
+    logger.info("Preview process stopped")
 
 
-def mjpeg_generator():
-    global preview_process
+def mjpeg_generator() -> Iterator[bytes]:
+    if preview_process is None or preview_process.stdout is None:
+        return
 
     buffer = b""
-
-    while preview_process is not None and preview_process.poll() is None:
+    while preview_process.poll() is None:
         chunk = preview_process.stdout.read(4096)
-
         if not chunk:
             break
 
         buffer += chunk
-
         while True:
             start = buffer.find(b"\xff\xd8")
             end = buffer.find(b"\xff\xd9")
 
-            if start != -1 and end != -1 and end > start:
-                frame = buffer[start:end + 2]
-                buffer = buffer[end + 2:]
-
-                yield (
-                    b"--frame\r\n"
-                    b"Content-Type: image/jpeg\r\n\r\n" +
-                    frame +
-                    b"\r\n"
-                )
-            else:
+            if start == -1 or end == -1 or end <= start:
                 break
 
+            frame = buffer[start : end + 2]
+            buffer = buffer[end + 2 :]
+            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
 
-@app.post("/trigger")
-async def trigger(request: Request):
-    body = {}
 
+async def parse_trigger_body(request: Request) -> dict[str, Any]:
     try:
         body = await request.json()
     except Exception:
-        pass
+        return {}
 
-    event_id = body.get("event_id") or str(uuid.uuid4())
-    created_at = body.get("created_at") or datetime.now(timezone.utc).isoformat()
+    return body if isinstance(body, dict) else {}
+
+
+@app.post("/trigger")
+async def trigger(request: Request) -> dict[str, Any]:
+    body = await parse_trigger_body(request)
+    event_id = str(body.get("event_id") or uuid.uuid4())
+    created_at = str(body.get("created_at") or datetime.now(timezone.utc).isoformat())
 
     if not buffer_ready():
         raise HTTPException(status_code=503, detail="Video buffer not ready")
 
-    await trigger_queue.put({
-        "event_id": event_id,
-        "created_at": created_at,
-    })
+    await trigger_queue.put({"event_id": event_id, "created_at": created_at})
 
     return {
         "status": "accepted",
@@ -468,7 +511,7 @@ async def trigger(request: Request):
 
 
 @app.get("/health")
-async def health():
+async def health() -> dict[str, Any]:
     ffmpeg_ok = ffmpeg_process is not None and ffmpeg_process.poll() is None
     recorder_ok = recorder_is_healthy()
 
@@ -482,7 +525,7 @@ async def health():
 
 
 @app.post("/preview/start")
-async def preview_start():
+async def preview_start() -> dict[str, str]:
     async with preview_lock:
         start_preview_process()
 
@@ -490,7 +533,7 @@ async def preview_start():
 
 
 @app.get("/preview")
-async def preview_stream():
+async def preview_stream() -> StreamingResponse:
     if preview_process is None or preview_process.poll() is not None:
         start_preview_process()
 
@@ -501,7 +544,7 @@ async def preview_stream():
 
 
 @app.post("/preview/stop")
-async def preview_stop():
+async def preview_stop() -> dict[str, str]:
     async with preview_lock:
         stop_preview_process()
         start_ffmpeg()
@@ -510,30 +553,13 @@ async def preview_stop():
 
 
 @app.get("/mode")
-async def mode():
+async def mode() -> dict[str, str]:
     preview_running = preview_process is not None and preview_process.poll() is None
     return {
         "mode": "preview" if preview_running else "recording",
         "node_id": NODE_ID,
     }
 
-# @app.on_event("shutdown")
-# async def shutdown():
-#     print("Shutting down video node...")
-#     stop_ffmpeg()
-
-# @app.on_event("startup")
-# async def startup():
-#     ensure_dirs()
-#     start_ffmpeg()
-
-#     asyncio.create_task(monitor_ffmpeg())
-#     asyncio.create_task(trigger_worker())
-#     asyncio.create_task(heartbeat_worker())
 
 if __name__ == "__main__":
-    uvicorn.run(
-        app,
-        host="0.0.0.0",
-        port=cfg["trigger"]["port"],
-    )
+    uvicorn.run(app, host="0.0.0.0", port=int(cfg["trigger"]["port"]))
