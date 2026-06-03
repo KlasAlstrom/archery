@@ -19,15 +19,19 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+import os
+import signal
 
 CONFIG_PATH = Path("config.yaml")
 MAC_ADDRESS_PATH = Path("/sys/class/net/wlan0/address")
 HEARTBEAT_INTERVAL_SECONDS = 30
 FFMPEG_HEALTH_CHECK_INTERVAL_SECONDS = 3
-RECORDER_MAX_SEGMENT_AGE_SECONDS = 3
+RECORDER_MAX_SEGMENT_AGE_SECONDS = 8
 UPLOAD_RETRY_INTERVAL_SECONDS = 3
 PREVIEW_FRAME_RATE = 10
 PREVIEW_SCALE = "640:-1"
+ffmpeg_started_at = 0.0
+current_mode = "recording"
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -156,59 +160,89 @@ def recorder_is_healthy() -> bool:
 
 def build_recording_command() -> list[str]:
     camera_cfg = cfg["camera"]
-    fps = str(camera_cfg["fps"])
 
-    return [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-f",
-        "v4l2",
-        "-input_format",
-        str(camera_cfg.get("input_format", "mjpeg")),
-        "-video_size",
-        f'{camera_cfg["width"]}x{camera_cfg["height"]}',
-        "-framerate",
-        fps,
-        "-i",
-        str(camera_cfg["device"]),
-        "-an",
-        "-vf",
-        "format=yuv420p",
-        "-c:v",
-        "libx264",
-        "-preset",
-        "ultrafast",
-        "-crf",
-        "28",
-        "-g",
-        fps,
-        "-keyint_min",
-        fps,
-        "-sc_threshold",
-        "0",
-        "-f",
-        "segment",
-        "-segment_time",
-        str(SEGMENT_SECONDS),
-        "-segment_wrap",
-        str(SEGMENT_COUNT),
-        "-segment_format",
-        "mpegts",
-        "-reset_timestamps",
-        "1",
-        str(SEGMENT_PATTERN),
-    ]
+    if camera_cfg.get("type") == "picam":
+        return [
+            "bash",
+            "-lc",
+            (
+                f"rpicam-vid --nopreview -t 0 "
+                f"--width {camera_cfg['width']} "
+                f"--height {camera_cfg['height']} "
+                f"--framerate {camera_cfg['fps']} "
+                f"--codec h264 "
+                f"--inline "
+                f"-o - "
+                f"| ffmpeg -hide_banner -loglevel warning "
+                f"-f h264 -i pipe:0 "
+                f"-c copy "
+                f"-f segment "
+                f"-segment_time {SEGMENT_SECONDS} "
+                f"-segment_wrap {SEGMENT_COUNT} "
+                f"-segment_format mpegts "
+                f"-reset_timestamps 1 "
+                f"{SEGMENT_PATTERN}"
+            ),
+        ]
+
+    if camera_cfg.get("type") == "usb":
+        fps = str(camera_cfg["fps"])
+
+        return [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-f",
+            "v4l2",
+            "-input_format",
+            str(camera_cfg.get("input_format", "mjpeg")),
+            "-video_size",
+            f'{camera_cfg["width"]}x{camera_cfg["height"]}',
+            "-framerate",
+            fps,
+            "-i",
+            str(camera_cfg["device"]),
+            "-an",
+            "-vf",
+            "format=yuv420p",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "28",
+            "-g",
+            fps,
+            "-keyint_min",
+            fps,
+            "-sc_threshold",
+            "0",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(SEGMENT_SECONDS),
+            "-segment_wrap",
+            str(SEGMENT_COUNT),
+            "-segment_format",
+            "mpegts",
+            "-reset_timestamps",
+            "1",
+            str(SEGMENT_PATTERN),
+        ]
 
 
 def start_ffmpeg() -> None:
-    global ffmpeg_process
+    global ffmpeg_process, ffmpeg_started_at
 
     if ffmpeg_process is not None and ffmpeg_process.poll() is None:
         return
 
-    ffmpeg_process = subprocess.Popen(build_recording_command())
+    ffmpeg_process = subprocess.Popen(
+        build_recording_command(),
+        start_new_session=True,
+    )
+    ffmpeg_started_at = time.monotonic()
     logger.info("FFmpeg recorder started")
 
 
@@ -224,20 +258,32 @@ def stop_ffmpeg() -> None:
 
 def terminate_process(process: subprocess.Popen[bytes]) -> None:
     try:
-        process.terminate()
+        os.killpg(os.getpgid(process.pid), signal.SIGTERM)
         process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
+    except Exception:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            process.wait(timeout=5)
+        except Exception:
+            process.kill()
+            process.wait(timeout=5)
 
 
 async def monitor_ffmpeg() -> None:
     while True:
+        if current_mode != "recording":
+            await asyncio.sleep(FFMPEG_HEALTH_CHECK_INTERVAL_SECONDS)
+            continue
+
         ffmpeg_dead = ffmpeg_process is None or ffmpeg_process.poll() is not None
 
         if ffmpeg_dead:
             logger.warning("FFmpeg is not running; restarting")
             start_ffmpeg()
+
+        elif time.monotonic() - ffmpeg_started_at < 10:
+            pass
+
         elif not recorder_is_healthy():
             logger.warning("Recorder is unhealthy; restarting FFmpeg")
             stop_ffmpeg()
@@ -408,29 +454,45 @@ async def trigger_worker() -> None:
 def build_preview_command() -> list[str]:
     camera_cfg = cfg["camera"]
 
-    return [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "warning",
-        "-f",
-        "v4l2",
-        "-input_format",
-        str(camera_cfg.get("input_format", "mjpeg")),
-        "-video_size",
-        f'{camera_cfg["width"]}x{camera_cfg["height"]}',
-        "-framerate",
-        str(PREVIEW_FRAME_RATE),
-        "-i",
-        str(camera_cfg["device"]),
-        "-vf",
-        f"scale={PREVIEW_SCALE}",
-        "-q:v",
-        "5",
-        "-f",
-        "mjpeg",
-        "pipe:1",
-    ]
+    if camera_cfg.get("type") == "picam":
+        return [
+            "bash",
+            "-lc",
+            (
+                f"rpicam-vid --nopreview -t 0 "
+                f"--width 640 "
+                f"--height 360 "
+                f"--framerate {PREVIEW_FRAME_RATE} "
+                f"--codec mjpeg "
+                f"--flush "
+                f"-o -"
+            ),
+        ]
+
+    if camera_cfg.get("type") == "usb":
+        return [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-f",
+            "v4l2",
+            "-input_format",
+            str(camera_cfg.get("input_format", "mjpeg")),
+            "-video_size",
+            f'{camera_cfg["width"]}x{camera_cfg["height"]}',
+            "-framerate",
+            str(PREVIEW_FRAME_RATE),
+            "-i",
+            str(camera_cfg["device"]),
+            "-vf",
+            f"scale={PREVIEW_SCALE}",
+            "-q:v",
+            "5",
+            "-f",
+            "mjpeg",
+            "pipe:1",
+        ]
 
 
 def start_preview_process() -> None:
@@ -438,15 +500,13 @@ def start_preview_process() -> None:
 
     if preview_process is not None and preview_process.poll() is None:
         return
-
-    stop_ffmpeg()
     preview_process = subprocess.Popen(
         build_preview_command(),
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
         bufsize=0,
+        start_new_session=True,
     )
-    logger.info("Preview process started")
 
 
 def stop_preview_process() -> None:
@@ -526,7 +586,12 @@ async def health() -> dict[str, Any]:
 
 @app.post("/preview/start")
 async def preview_start() -> dict[str, str]:
+    global current_mode
+
     async with preview_lock:
+        current_mode = "preview"
+        stop_ffmpeg()
+        await asyncio.sleep(1.0)
         start_preview_process()
 
     return {"status": "preview_started"}
@@ -545,8 +610,12 @@ async def preview_stream() -> StreamingResponse:
 
 @app.post("/preview/stop")
 async def preview_stop() -> dict[str, str]:
+    global current_mode
+
     async with preview_lock:
         stop_preview_process()
+        await asyncio.sleep(1.0)
+        current_mode = "recording"
         start_ffmpeg()
 
     return {"status": "recording_started"}
@@ -554,9 +623,8 @@ async def preview_stop() -> dict[str, str]:
 
 @app.get("/mode")
 async def mode() -> dict[str, str]:
-    preview_running = preview_process is not None and preview_process.poll() is None
     return {
-        "mode": "preview" if preview_running else "recording",
+        "mode": current_mode,
         "node_id": NODE_ID,
     }
 
