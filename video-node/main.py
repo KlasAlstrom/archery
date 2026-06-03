@@ -525,7 +525,13 @@ def mjpeg_generator() -> Iterator[bytes]:
         return
 
     buffer = b""
-    while preview_process.poll() is None:
+    while (
+        preview_process is not None
+        and preview_process.poll() is None
+    ):
+        if preview_process is None or preview_process.stdout is None:
+            break
+
         chunk = preview_process.stdout.read(4096)
         if not chunk:
             break
