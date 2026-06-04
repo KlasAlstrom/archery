@@ -58,6 +58,7 @@ SEGMENT_COUNT = int(cfg["buffer"]["segment_count"])
 SEGMENT_SECONDS = int(cfg["buffer"]["segment_seconds"])
 PRE_SECONDS = int(cfg["trigger"]["pre_seconds"])
 POST_SECONDS = int(cfg["trigger"]["post_seconds"])
+TRIGGER_INDEX_OFFSET = int(cfg["trigger"].get("trigger_index_offset", 0))
 UPLOAD_URL = str(cfg["server"]["upload_url"])
 TOKEN = str(cfg["server"]["token"])
 SEGMENT_PATTERN = SEGMENT_DIR / "segment_%03d.ts"
@@ -613,12 +614,17 @@ async def trigger(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Video buffer not ready")
 
     trigger_index = newest_safe_segment_index()
+    logger.info("trigger_index = %d ", trigger_index)
+
+    if trigger_index is not None:
+        trigger_index = (trigger_index + TRIGGER_INDEX_OFFSET) % SEGMENT_COUNT
 
     if trigger_index is None:
         raise HTTPException(status_code=503, detail="Video buffer not ready")
 
     if not buffer_ready():
         raise HTTPException(status_code=503, detail="Video buffer not ready")
+    logger.info("trigger_index = %d after offset", trigger_index)
 
     await trigger_queue.put({
         "event_id": event_id,

@@ -14,6 +14,7 @@ buffer:
 trigger:
   pre_seconds: 3
   post_seconds: 3
+  trigger_index_offset: 0
   port: 8080
 
 server:
