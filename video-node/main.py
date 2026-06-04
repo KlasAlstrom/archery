@@ -40,6 +40,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 class TriggerEvent(TypedDict):
     event_id: str
     created_at: str
+    trigger_index: int
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -141,6 +142,40 @@ def required_segment_count(seconds: int) -> int:
     return seconds // SEGMENT_SECONDS + 2
 
 
+def segment_index(path: Path) -> int:
+    # segment_007.ts -> 7
+    return int(path.stem.split("_")[1])
+
+
+def newest_safe_segment_index() -> int | None:
+    safe_segments = get_safe_segments()
+
+    if not safe_segments:
+        return None
+
+    return segment_index(safe_segments[-1])
+
+
+def select_segments_around_index(
+    trigger_index: int,
+    pre_count: int,
+    post_count: int,
+) -> list[Path]:
+    selected: list[Path] = []
+
+    logger.info("trigger_index = %d pre_count = %d post_count = %d", trigger_index, pre_count, post_count)
+    logger.info("trigger_index - pre_count = %d trigger_index + post_count + 1 = %d", trigger_index - pre_count, trigger_index + post_count + 1)
+    for logical_index in range(trigger_index - pre_count, trigger_index + post_count + 1):
+        wrapped_index = logical_index % SEGMENT_COUNT
+        logger.info("wrapped_index = %d", wrapped_index)
+        segment = SEGMENT_DIR / f"segment_{wrapped_index:03d}.ts"
+
+        if segment.exists() and segment.stat().st_size > 0:
+            selected.append(segment)
+
+    return selected
+
+
 def buffer_ready() -> bool:
     return len(get_safe_segments()) >= required_segment_count(PRE_SECONDS)
 
@@ -171,6 +206,7 @@ def build_recording_command() -> list[str]:
                 f"--height {camera_cfg['height']} "
                 f"--framerate {camera_cfg['fps']} "
                 f"--codec h264 "
+                f"--intra {camera_cfg['fps']} "
                 f"--inline "
                 f"-o - "
                 f"| ffmpeg -hide_banner -loglevel warning "
@@ -313,15 +349,24 @@ async def heartbeat_worker() -> None:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
-async def build_clip(event_id: str) -> Path:
-    total_seconds = PRE_SECONDS + POST_SECONDS
-    expected_segments = required_segment_count(total_seconds)
+async def build_clip(event_id: str, trigger_index: int) -> Path:
+    pre_count = PRE_SECONDS // SEGMENT_SECONDS
+    post_count = POST_SECONDS // SEGMENT_SECONDS
 
+    # Important:
+    # Do not test whether post-trigger segment files exist immediately.
+    # In a circular buffer they may already exist as old files.
+    # Wait until FFmpeg has had time to overwrite them with new post-trigger data.
     await asyncio.sleep(POST_SECONDS + 0.5)
 
-    segments = select_recent_segments(total_seconds)
-    if len(segments) < expected_segments:
-        raise RuntimeError("Not enough video segments available")
+    segments = select_segments_around_index(
+        trigger_index=trigger_index,
+        pre_count=pre_count,
+        post_count=post_count,
+    )
+
+    if len(segments) < 2:
+        raise RuntimeError("Too few video segments available")
 
     event_dir = CLIP_DIR / event_id
     output_file = CLIP_DIR / f"{event_id}.mp4"
@@ -437,7 +482,7 @@ async def trigger_worker() -> None:
         try:
             event_id = event["event_id"]
             logger.info("Building clip %s", event_id)
-            clip = await build_clip(event_id)
+            clip = await build_clip(event_id, event["trigger_index"])
 
             logger.info("Uploading clip %s", event_id)
             uploaded = await upload_clip(event_id, clip, event["created_at"])
@@ -567,7 +612,19 @@ async def trigger(request: Request) -> dict[str, Any]:
     if not buffer_ready():
         raise HTTPException(status_code=503, detail="Video buffer not ready")
 
-    await trigger_queue.put({"event_id": event_id, "created_at": created_at})
+    trigger_index = newest_safe_segment_index()
+
+    if trigger_index is None:
+        raise HTTPException(status_code=503, detail="Video buffer not ready")
+
+    if not buffer_ready():
+        raise HTTPException(status_code=503, detail="Video buffer not ready")
+
+    await trigger_queue.put({
+        "event_id": event_id,
+        "created_at": created_at,
+        "trigger_index": trigger_index,
+    })
 
     return {
         "status": "accepted",
