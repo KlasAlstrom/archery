@@ -24,7 +24,7 @@ import signal
 
 CONFIG_PATH = Path("config.yaml")
 MAC_ADDRESS_PATH = Path("/sys/class/net/wlan0/address")
-HEARTBEAT_INTERVAL_SECONDS = 30
+HEARTBEAT_INTERVAL_SECONDS = 10
 FFMPEG_HEALTH_CHECK_INTERVAL_SECONDS = 3
 RECORDER_MAX_SEGMENT_AGE_SECONDS = 8
 UPLOAD_RETRY_INTERVAL_SECONDS = 3
@@ -58,7 +58,8 @@ SEGMENT_COUNT = int(cfg["buffer"]["segment_count"])
 SEGMENT_SECONDS = int(cfg["buffer"]["segment_seconds"])
 PRE_SECONDS = int(cfg["trigger"]["pre_seconds"])
 POST_SECONDS = int(cfg["trigger"]["post_seconds"])
-TRIGGER_INDEX_OFFSET = int(cfg["trigger"].get("trigger_index_offset", 0))
+#TRIGGER_INDEX_OFFSET = int(cfg["trigger"].get("trigger_index_offset", 0))
+TRIGGER_INDEX_OFFSET = int(cfg["trigger"]["trigger_index_offset"])
 UPLOAD_URL = str(cfg["server"]["upload_url"])
 TOKEN = str(cfg["server"]["token"])
 SEGMENT_PATTERN = SEGMENT_DIR / "segment_%03d.ts"
