@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import BigInteger, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -61,6 +61,7 @@ class Node(Base):
     __tablename__ = "nodes"
 
     node_id = Column(String, primary_key=True)
+    alias = Column(String, nullable=True)
     ip_address = Column(String, nullable=True)
     last_seen = Column(DateTime, nullable=False)
     status = Column(String, nullable=False)
@@ -73,6 +74,11 @@ def db_session() -> Iterator[Session]:
         yield session
     finally:
         session.close()
+
+
+def next_node_alias(session: Session) -> str:
+    count = session.query(Node).count()
+    return f"cam-{count + 1}"
 
 
 def utc_now() -> datetime:
@@ -109,6 +115,7 @@ def is_node_online(node: Node, now: datetime | None = None) -> bool:
 def node_to_dict(node: Node, now: datetime | None = None) -> dict[str, Any]:
     return {
         "node_id": node.node_id,
+        "alias": node.alias or node.node_id,
         "ip_address": node.ip_address,
         "status": "online" if is_node_online(node, now) else "offline",
         "last_seen": utc_iso(node.last_seen),
@@ -263,6 +270,33 @@ async def upload_video(
         raise
 
 
+@app.post("/api/nodes/{node_id}/alias")
+async def update_node_alias(
+    node_id: str,
+    request: Request,
+) -> dict[str, Any]:
+    body = await request.json()
+    alias = str(body.get("alias", "")).strip()
+
+    if not alias:
+        raise HTTPException(status_code=400, detail="Alias may not be empty")
+
+    with db_session() as session:
+        node = session.query(Node).filter(Node.node_id == node_id).first()
+
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        node.alias = alias
+        session.commit()
+
+    return {
+        "status": "ok",
+        "node_id": node_id,
+        "alias": alias,
+    }
+
+
 @app.get("/api/videos")
 def list_videos(limit: int = 100, offset: int = 0, node_id: str | None = None) -> dict[str, Any]:
     with db_session() as session:
@@ -304,7 +338,13 @@ def heartbeat(
         node = session.query(Node).filter(Node.node_id == node_id).first()
 
         if node is None:
-            session.add(Node(node_id=node_id, ip_address=ip_address, last_seen=utc_now(), status=status))
+            session.add(Node(
+                node_id=node_id,
+                alias=next_node_alias(session),
+                ip_address=ip_address,
+                last_seen=utc_now(),
+                status=status,
+            ))
         else:
             node.ip_address = ip_address
             node.last_seen = utc_now()
@@ -770,6 +810,7 @@ INDEX_HTML = """<!doctype html>
 let offset = 0;
 const limit = 100;
 let knownNodes = new Set();
+let nodeAliases = {};
 
 function fmtSize(bytes) {
   return Math.round(bytes / 1024 / 1024 * 10) / 10 + " MB";
@@ -797,17 +838,19 @@ async function loadNodes() {
 
   const filter = document.getElementById('nodeFilter');
 
+  nodeAliases = {};
   for (const n of nodes) {
+    nodeAliases[n.node_id] = n.alias;
     const div = document.createElement('div');
     div.className = 'node-row';
-    div.innerHTML = `${n.node_id}: <span class="${n.status}">${n.status}</span><br><small class="muted">Last seen: ${fmtLocalTime(n.last_seen)}</small>`;
+    div.innerHTML = `${n.alias}: <span class="${n.status}">${n.status}</span><br><small>Last seen: ${fmtLocalTime(n.last_seen)}</small>`;
     container.appendChild(div);
 
     if (!knownNodes.has(n.node_id)) {
       knownNodes.add(n.node_id);
       const opt = document.createElement('option');
       opt.value = n.node_id;
-      opt.textContent = n.node_id;
+      opt.textContent = n.alias;
       filter.appendChild(opt);
     }
   }
@@ -848,7 +891,7 @@ async function loadVideos(resetOffset = false) {
           >
 
           <div>
-            <b>${clip.node_id}</b><br>
+            <b>${nodeAliases[clip.node_id] || clip.node_id}</b><br>
             <small class="muted">
               ${clip.duration_seconds}s |
               ${fmtSize(clip.filesize_bytes)}
@@ -909,7 +952,7 @@ function playClip(e, videoId, nodeId, localTime) {
   player.src = `/api/video/${videoId}`;
 
   document.getElementById('playerTitle').innerText =
-    `${nodeId} — ${localTime}`;
+    `${nodeAliases[nodeId] || nodeId} — ${localTime}`;
 
   player.play();
 }
@@ -1032,6 +1075,8 @@ STATUS_HTML = """<!doctype html>
 </div>
 
 <script>
+let editingAlias = false;
+
 function fmtSize(bytes) {
   return Math.round(bytes / 1024 / 1024 / 1024 * 10) / 10 + " GB";
 }
@@ -1055,22 +1100,66 @@ async function loadStatus() {
   `;
 
   document.getElementById('nodes').innerHTML = s.nodes.map(n => `
-    <div class="node-row">
-      <b>${n.node_id}</b>
+    <div>
+      <b>${n.alias}</b>
       <span class="${n.status}">${n.status}</span><br>
-      <span class="muted">IP: ${n.ip_address || "-"}</span><br>
-      <span class="muted">Last seen: ${fmtLocalTime(n.last_seen)}</span>
-    </div>
-  `).join('');
+      Real ID: <small>${n.node_id}</small><br>
+      IP: ${n.ip_address || "-"}<br>
+      Last seen: ${fmtLocalTime(n.last_seen)}<br>
+  
+      <input
+        id="alias-${n.node_id}"
+        value="${n.alias}"
+        onfocus="editingAlias = true"
+        onblur="editingAlias = false"
+        style="font-size:16px; padding:8px; margin-top:6px;"
+      >      
 
+      <button onclick="saveAlias('${n.node_id}')">
+        Save name
+      </button>
+    </div><br>
+  `).join('');  
+  
   document.getElementById('videos').innerHTML = `
     Stored clips: <b>${s.video_count}</b><br>
     Latest upload: <b>${fmtLocalTime(s.latest_upload)}</b>
   `;
 }
 
+async function saveAlias(nodeId) {
+  const input = document.getElementById(`alias-${nodeId}`);
+  const alias = input.value.trim();
+
+  if (!alias) {
+    alert("Name may not be empty");
+    return;
+  }
+
+  editingAlias = false;
+
+  const res = await fetch(`/api/nodes/${nodeId}/alias`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ alias }),
+  });
+
+  if (!res.ok) {
+    alert("Failed to save name");
+    return;
+  }
+
+  await loadStatus();
+}
+
 loadStatus();
-setInterval(loadStatus, 10000);
+setInterval(() => {
+  if (!editingAlias) {
+    loadStatus();
+  }
+}, 10000);
 </script>
 </body>
 </html>
@@ -1110,13 +1199,13 @@ async function loadNodes() {
 
   const container = document.getElementById('nodes');
   container.innerHTML = '';
-
+  
   for (const n of nodes) {
     const div = document.createElement('div');
     div.className = 'node-row';
 
     div.innerHTML = `
-      <b>${n.node_id}</b>
+      <b>${n.alias}</b><br>
       <span class="${n.status}">${n.status}</span><br>
       <small class="muted">${n.ip_address || '-'}</small><br>
       <button onclick="startPreview('${n.node_id}', '${n.ip_address}')">Start preview</button>
