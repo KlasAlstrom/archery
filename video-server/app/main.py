@@ -568,6 +568,22 @@ def aim_page() -> str:
     return AIM_HTML
 
 
+@app.delete("/api/nodes/{node_id}")
+def delete_node(node_id: str) -> dict[str, Any]:
+    with db_session() as session:
+        node = session.query(Node).filter(Node.node_id == node_id).first()
+
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+
+        if is_node_online(node):
+            raise HTTPException(status_code=400, detail="Cannot delete online node")
+
+        session.delete(node)
+        session.commit()
+
+    return {"status": "ok", "deleted": node_id}
+
 COMMON_CSS = """
 <style>
   :root {
@@ -1118,6 +1134,14 @@ async function loadStatus() {
       <button onclick="saveAlias('${n.node_id}')">
         Save name
       </button>
+
+      <button
+        onclick="deleteNode('${n.node_id}')"
+        ${n.status === "online" ? "disabled" : ""}
+      >
+        Delete node
+      </button>
+
     </div><br>
   `).join('');  
   
@@ -1148,6 +1172,23 @@ async function saveAlias(nodeId) {
 
   if (!res.ok) {
     alert("Failed to save name");
+    return;
+  }
+
+  await loadStatus();
+}
+
+async function deleteNode(nodeId) {
+  if (!confirm("Delete this offline node?")) {
+    return;
+  }
+
+  const res = await fetch(`/api/nodes/${nodeId}`, {
+    method: "DELETE"
+  });
+
+  if (!res.ok) {
+    alert("Failed to delete node");
     return;
   }
 
