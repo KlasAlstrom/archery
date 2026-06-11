@@ -13,7 +13,7 @@ const char* TRIGGER_URL   = "http://192.168.60.1/api/trigger-all";
 Adafruit_MPU6050 mpu;
 
 // ---------- Shot detection ----------
-const float SHOT_THRESHOLD = 35.0;   // Tune this value
+const float SHOT_THRESHOLD = 80.0;   // Tune this value
 const unsigned long MIN_SHOT_INTERVAL_MS = 1000;
 
 unsigned long lastShotTime = 0;
@@ -104,6 +104,17 @@ void setup() {
   Serial.println("Ready.");
 }
 
+void logAccelValues(const float x, const float y, const float z){
+  Serial.print("x=");
+  Serial.print(x);
+  Serial.print(" y=");
+  Serial.print(y);
+  Serial.print(" z=");
+  Serial.print(z);
+  Serial.print(" sum=");
+  Serial.println(impactValue);
+}
+
 void loop() {
   unsigned long now = millis();
 
@@ -125,15 +136,6 @@ void loop() {
 
   float impactValue = abs(x) + abs(y) + abs(z);
 
-  Serial.print("x=");
-  Serial.print(x);
-  Serial.print(" y=");
-  Serial.print(y);
-  Serial.print(" z=");
-  Serial.print(z);
-  Serial.print(" sum=");
-  Serial.println(impactValue);
-
   bool overThreshold = impactValue > SHOT_THRESHOLD;
   bool cooldownPassed = now - lastShotTime >= MIN_SHOT_INTERVAL_MS;
 
@@ -141,8 +143,9 @@ void loop() {
     lastShotTime = now;
 
     Serial.println("SHOT DETECTED!");
+    logAccelValues(x, y, z);
 
-    bool ok = sendTrigger();
+    const bool ok = sendTrigger();
 
     if (ok) {
       Serial.println("Trigger sent successfully.");
