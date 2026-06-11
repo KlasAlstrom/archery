@@ -40,7 +40,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 class TriggerEvent(TypedDict):
     event_id: str
     created_at: str
-    trigger_index: int
+    trigger_segment: str
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -54,12 +54,16 @@ BASE_DIR = Path(cfg["buffer"]["base_dir"])
 SEGMENT_DIR = BASE_DIR / "segments"
 CLIP_DIR = BASE_DIR / "clips"
 
-SEGMENT_COUNT = int(cfg["buffer"]["segment_count"])
-SEGMENT_SECONDS = int(cfg["buffer"]["segment_seconds"])
 PRE_SECONDS = int(cfg["trigger"]["pre_seconds"])
 POST_SECONDS = int(cfg["trigger"]["post_seconds"])
-#TRIGGER_INDEX_OFFSET = int(cfg["trigger"].get("trigger_index_offset", 0))
-TRIGGER_INDEX_OFFSET = int(cfg["trigger"]["trigger_index_offset"])
+SEGMENT_SECONDS = int(cfg["buffer"]["segment_seconds"])
+BUFFER_EXTRA_SECONDS = int(cfg["buffer"].get("extra_seconds", 10))
+
+SEGMENT_COUNT = max(
+    10,
+    (PRE_SECONDS + POST_SECONDS + BUFFER_EXTRA_SECONDS) // SEGMENT_SECONDS,
+)
+
 UPLOAD_URL = str(cfg["server"]["upload_url"])
 TOKEN = str(cfg["server"]["token"])
 SEGMENT_PATTERN = SEGMENT_DIR / "segment_%03d.ts"
@@ -130,6 +134,27 @@ def get_local_ip() -> str:
             return "127.0.0.1"
 
 
+def segment_sort_key(path: Path) -> tuple[float, str]:
+    return (path.stat().st_mtime, path.name)
+
+
+def get_segments_by_mtime() -> list[Path]:
+    segments = [
+        path for path in SEGMENT_DIR.glob("segment_*.ts")
+        if path.stat().st_size > 0
+    ]
+    return sorted(segments, key=segment_sort_key)
+
+
+def newest_safe_segment() -> Path | None:
+    segments = get_segments_by_mtime()
+
+    if len(segments) < 2:
+        return None
+
+    # Ignore newest because it may still be written.
+    return segments[-2]
+
 def get_segments_by_mtime() -> list[Path]:
     segments = [path for path in SEGMENT_DIR.glob("segment_*.ts") if path.stat().st_size > 0]
     return sorted(segments, key=lambda path: path.stat().st_mtime)
@@ -144,39 +169,34 @@ def required_segment_count(seconds: int) -> int:
     return seconds // SEGMENT_SECONDS + 2
 
 
-def segment_index(path: Path) -> int:
-    # segment_007.ts -> 7
-    return int(path.stem.split("_")[1])
-
-
-def newest_safe_segment_index() -> int | None:
-    safe_segments = get_safe_segments()
-
-    if not safe_segments:
-        return None
-
-    return segment_index(safe_segments[-1])
-
-
-def select_segments_around_index(
-    trigger_index: int,
+def select_segments_around_trigger_segment(
+    trigger_segment_name: str,
     pre_count: int,
     post_count: int,
 ) -> list[Path]:
-    selected: list[Path] = []
+    segments = get_segments_by_mtime()
+    names = [segment.name for segment in segments]
 
-    logger.info("trigger_index = %d pre_count = %d post_count = %d", trigger_index, pre_count, post_count)
-    logger.info("trigger_index - pre_count = %d trigger_index + post_count + 1 = %d", trigger_index - pre_count, trigger_index + post_count + 1)
-    for logical_index in range(trigger_index - pre_count, trigger_index + post_count + 1):
-        wrapped_index = logical_index % SEGMENT_COUNT
-        logger.info("wrapped_index = %d", wrapped_index)
-        segment = SEGMENT_DIR / f"segment_{wrapped_index:03d}.ts"
+    if trigger_segment_name not in names:
+        # The exact trigger segment may have wrapped away.
+        # Fall back to newest available safe segment.
+        trigger_pos = max(0, len(segments) - post_count - 1)
+    else:
+        trigger_pos = names.index(trigger_segment_name)
 
-        if segment.exists() and segment.stat().st_size > 0:
-            selected.append(segment)
+    start = max(0, trigger_pos - pre_count)
+    end = min(len(segments), trigger_pos + post_count + 1)
+
+    selected = segments[start:end]
+
+    logger.info(
+        "clip_select trigger=%s trigger_pos=%s selected=%s",
+        trigger_segment_name,
+        trigger_pos,
+        [p.name for p in selected],
+    )
 
     return selected
-
 
 def buffer_ready() -> bool:
     return len(get_safe_segments()) >= required_segment_count(PRE_SECONDS)
@@ -351,18 +371,14 @@ async def heartbeat_worker() -> None:
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
 
-async def build_clip(event_id: str, trigger_index: int) -> Path:
+async def build_clip(event_id: str, trigger_segment: str) -> Path:
     pre_count = PRE_SECONDS // SEGMENT_SECONDS
     post_count = POST_SECONDS // SEGMENT_SECONDS
 
-    # Important:
-    # Do not test whether post-trigger segment files exist immediately.
-    # In a circular buffer they may already exist as old files.
-    # Wait until FFmpeg has had time to overwrite them with new post-trigger data.
     await asyncio.sleep(POST_SECONDS + 0.5)
 
-    segments = select_segments_around_index(
-        trigger_index=trigger_index,
+    segments = select_segments_around_trigger_segment(
+        trigger_segment_name=trigger_segment,
         pre_count=pre_count,
         post_count=post_count,
     )
@@ -484,7 +500,7 @@ async def trigger_worker() -> None:
         try:
             event_id = event["event_id"]
             logger.info("Building clip %s", event_id)
-            clip = await build_clip(event_id, event["trigger_index"])
+            clip = await build_clip(event_id, event["trigger_segment"])
 
             logger.info("Uploading clip %s", event_id)
             uploaded = await upload_clip(event_id, clip, event["created_at"])
@@ -605,6 +621,18 @@ async def parse_trigger_body(request: Request) -> dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
+def offset_segment(segment: Path, offset: int) -> Path:
+    segments = get_segments_by_mtime()
+    names = [p.name for p in segments]
+
+    if segment.name not in names:
+        return segment
+
+    pos = names.index(segment.name)
+    new_pos = min(len(segments) - 1, max(0, pos + offset))
+    return segments[new_pos]
+
+
 @app.post("/trigger")
 async def trigger(request: Request) -> dict[str, Any]:
     body = await parse_trigger_body(request)
@@ -614,23 +642,20 @@ async def trigger(request: Request) -> dict[str, Any]:
     if not buffer_ready():
         raise HTTPException(status_code=503, detail="Video buffer not ready")
 
-    trigger_index = newest_safe_segment_index()
-    logger.info("trigger_index = %d ", trigger_index)
+    trigger_segment = newest_safe_segment()
+    TRIGGER_SEGMENT_OFFSET = int(cfg["trigger"].get("trigger_segment_offset", 0))
 
-    if trigger_index is not None:
-        trigger_index = (trigger_index + TRIGGER_INDEX_OFFSET) % SEGMENT_COUNT
-
-    if trigger_index is None:
+    if trigger_segment is None:
         raise HTTPException(status_code=503, detail="Video buffer not ready")
+    trigger_segment = offset_segment(trigger_segment, TRIGGER_SEGMENT_OFFSET)
 
     if not buffer_ready():
         raise HTTPException(status_code=503, detail="Video buffer not ready")
-    logger.info("trigger_index = %d after offset", trigger_index)
 
     await trigger_queue.put({
         "event_id": event_id,
         "created_at": created_at,
-        "trigger_index": trigger_index,
+        "trigger_segment": trigger_segment.name,
     })
 
     return {

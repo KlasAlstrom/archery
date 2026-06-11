@@ -1,0 +1,187 @@
+For the **Pi Camera Module 3 node running on the host (not Docker)**, here's the complete setup we've converged on.
+
+## 1. Create a Python virtual environment
+
+```bash
+cd ~/archery/video-node
+
+python3 -m venv venv
+source venv/bin/activate
+
+pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+Verify:
+
+```bash
+python -c "import aiohttp; print('OK')"
+```
+
+## 2. Verify camera software
+
+```bash
+rpicam-vid --version
+ffmpeg -version
+```
+
+Both should work.
+
+## 3. Create the systemd service
+
+```bash
+sudo nano /etc/systemd/system/video-node.service
+```
+
+Contents:
+
+```ini
+[Unit]
+Description=Archery Video Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=klas
+WorkingDirectory=/home/klas/archery/video-node
+
+# Clean RAM buffer on startup
+ExecStartPre=/bin/rm -rf /dev/shm/video-node
+ExecStartPre=/bin/mkdir -p /dev/shm/video-node/segments
+ExecStartPre=/bin/mkdir -p /dev/shm/video-node/clips
+ExecStartPre=/bin/chown -R klas:klas /dev/shm/video-node
+
+ExecStart=/home/klas/archery/video-node/venv/bin/python /home/klas/archery/video-node/main.py
+
+Restart=always
+RestartSec=5
+
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Adjust:
+
+```text
+User=klas
+/home/klas/archery/video-node
+```
+
+to match your actual username and install location.
+
+## 4. Enable and start
+
+```bash
+sudo systemctl daemon-reload
+
+sudo systemctl enable video-node
+
+sudo systemctl start video-node
+```
+
+## 5. Check status
+
+```bash
+systemctl status video-node
+```
+
+You should see:
+
+```text
+active (running)
+```
+
+## 6. Watch logs
+
+Very useful while developing:
+
+```bash
+journalctl -u video-node -f
+```
+
+Or recent logs:
+
+```bash
+journalctl -u video-node -n 100
+```
+
+## 7. Restart after code changes
+
+```bash
+sudo systemctl restart video-node
+```
+
+## 8. Stop service
+
+```bash
+sudo systemctl stop video-node
+```
+
+## 9. Disable autostart
+
+```bash
+sudo systemctl disable video-node
+```
+
+## 10. Verify after reboot
+
+```bash
+sudo reboot
+```
+
+After reboot:
+
+```bash
+systemctl status video-node
+```
+
+and:
+
+```bash
+curl http://localhost:8080/health
+```
+
+should return:
+
+```json
+{"status":"ok"}
+```
+
+## Useful troubleshooting
+
+Show current service file:
+
+```bash
+systemctl cat video-node
+```
+
+See startup failures:
+
+```bash
+journalctl -u video-node -b
+```
+
+Check for stuck camera processes:
+
+```bash
+ps aux | grep rpicam
+ps aux | grep ffmpeg
+```
+
+Kill them manually if needed:
+
+```bash
+pkill -f rpicam-vid
+pkill -f ffmpeg
+```
+
+then:
+
+```bash
+sudo systemctl restart video-node
+```
+
+This is the setup I would use for all future **Pi Camera nodes**, while keeping the USB webcam nodes in Docker.

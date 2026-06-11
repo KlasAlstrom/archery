@@ -8,13 +8,13 @@ camera:
 
 buffer:
   base_dir: /dev/shm/video-node
-  segment_count: 20
   segment_seconds: 1
+  extra_seconds: 10
 
 trigger:
   pre_seconds: 3
   post_seconds: 3
-  trigger_index_offset: 0
+  trigger_segment_offset: 2
   port: 8080
 
 server:
