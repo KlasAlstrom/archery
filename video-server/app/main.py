@@ -12,6 +12,7 @@ import os
 import shutil
 import subprocess
 import uuid
+import asyncio
 from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -390,6 +391,32 @@ def get_thumbnail(video_id: str) -> FileResponse:
     return FileResponse(thumbnail, media_type="image/jpeg")
 
 
+async def trigger_node(
+    client: httpx.AsyncClient,
+    target: dict[str, str],
+    event_id: str,
+    created_at: str,
+) -> dict[str, Any]:
+    try:
+        response = await client.post(
+            target["url"],
+            json={"event_id": event_id, "created_at": created_at},
+        )
+        return {
+            "node_id": target["node_id"],
+            "ip_address": target["ip_address"],
+            "ok": response.status_code == 200,
+            "status_code": response.status_code,
+        }
+    except httpx.HTTPError as exc:
+        return {
+            "node_id": target["node_id"],
+            "ip_address": target["ip_address"],
+            "ok": False,
+            "error": str(exc),
+        }
+
+
 @app.post("/api/trigger-all")
 async def trigger_all() -> dict[str, Any]:
     shared_event_id = str(uuid.uuid4())
@@ -408,31 +435,14 @@ async def trigger_all() -> dict[str, Any]:
                     }
                 )
 
-    results = []
     async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
-        for target in targets:
-            try:
-                response = await client.post(
-                    target["url"],
-                    json={"event_id": shared_event_id, "created_at": created_at},
-                )
-                results.append(
-                    {
-                        "node_id": target["node_id"],
-                        "ip_address": target["ip_address"],
-                        "ok": response.status_code == 200,
-                        "status_code": response.status_code,
-                    }
-                )
-            except httpx.HTTPError as exc:
-                results.append(
-                    {
-                        "node_id": target["node_id"],
-                        "ip_address": target["ip_address"],
-                        "ok": False,
-                        "error": str(exc),
-                    }
-                )
+        results = await asyncio.gather(
+            *[
+                trigger_node(client, target, shared_event_id, created_at)
+                for target in targets
+            ]
+        )
+
 
     logger.info(
         "trigger_all event_id=%s targets=%s ok=%s",
