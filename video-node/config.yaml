@@ -23,3 +23,7 @@ server:
 
 clip:
   max_retry_seconds: 30
+
+power:
+  idle_timeout_seconds: 900
+  wake_on_trigger: true

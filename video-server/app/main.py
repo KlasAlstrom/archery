@@ -113,23 +113,15 @@ def is_node_online(node: Node, now: datetime | None = None) -> bool:
 
 
 def node_to_dict(node: Node, now: datetime | None = None) -> dict[str, Any]:
+    online = is_node_online(node, now)
+
     return {
         "node_id": node.node_id,
         "alias": node.alias or node.node_id,
-        "ip_address": node.ip_address,
-        "status": "online" if is_node_online(node, now) else "offline",
+        "online": online,
+        "status": node.status if online else "offline",
         "last_seen": utc_iso(node.last_seen),
-    }
-
-
-def video_to_dict(video: Video) -> dict[str, Any]:
-    return {
-        "id": video.id,
-        "node_id": video.node_id,
-        "event_id": video.event_id,
-        "created_at": utc_iso(video.created_at),
-        "duration_seconds": video.duration_seconds,
-        "filesize_bytes": video.filesize_bytes,
+        "ip_address": node.ip_address,
     }
 
 
@@ -548,6 +540,19 @@ async def api_preview_stop(node_id: str) -> dict[str, Any]:
     return {"status": "ok", "node_id": node_id, "node_response": response.json()}
 
 
+@app.post("/api/nodes/{node_id}/wake")
+async def api_wake_node(node_id: str) -> dict[str, Any]:
+    node = get_node_or_404(node_id)
+
+    async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
+        response = await client.post(f"http://{node['ip_address']}:8080/wake")
+
+    return {
+        "status": "ok",
+        "node_id": node_id,
+        "node_response": response.json(),
+    }
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -735,6 +740,11 @@ COMMON_CSS = """
 
   .online { color: green; font-weight: bold; }
   .offline { color: red; font-weight: bold; }
+  
+  .ready { color: #2e7d32; }
+  .camera_aim { color: #1565c0; }
+  .sleeping { color: #ef6c00; }
+  .offline { color: #c62828; }  
 
   @media (max-width: 800px) {
     .layout, .status-layout, .aim-layout {
@@ -832,6 +842,17 @@ function fmtSize(bytes) {
   return Math.round(bytes / 1024 / 1024 * 10) / 10 + " MB";
 }
 
+function statusLabel(status) {
+  const labels = {
+    ready: "Ready",
+    sleeping: "Sleeping",
+    camera_aim: "Camera Aim",
+    offline: "Offline"
+  };
+
+  return labels[status] || status;
+}
+
 function fmtLocalTime(isoString) {
   const date = new Date(isoString);
 
@@ -859,7 +880,7 @@ async function loadNodes() {
     nodeAliases[n.node_id] = n.alias;
     const div = document.createElement('div');
     div.className = 'node-row';
-    div.innerHTML = `${n.alias}: <span class="${n.status}">${n.status}</span><br><small>Last seen: ${fmtLocalTime(n.last_seen)}</small>`;
+    div.innerHTML = `${n.alias}: <span class="${n.status}">${statusLabel(n.status)}</span><br><small>Last seen: ${fmtLocalTime(n.last_seen)}</small>`;
     container.appendChild(div);
 
     if (!knownNodes.has(n.node_id)) {
@@ -1102,6 +1123,17 @@ function fmtLocalTime(isoString) {
   return new Date(isoString).toLocaleString();
 }
 
+function statusLabel(status) {
+  const labels = {
+    ready: "Ready",
+    sleeping: "Sleeping",
+    camera_aim: "Camera Aim",
+    offline: "Offline"
+  };
+
+  return labels[status] || status;
+}
+
 async function loadStatus() {
   const res = await fetch('/api/status');
   const s = await res.json();
@@ -1118,7 +1150,7 @@ async function loadStatus() {
   document.getElementById('nodes').innerHTML = s.nodes.map(n => `
     <div>
       <b>${n.alias}</b>
-      <span class="${n.status}">${n.status}</span><br>
+      <span class="${n.status}">${statusLabel(n.status)}</span><br>
       Real ID: <small>${n.node_id}</small><br>
       IP: ${n.ip_address || "-"}<br>
       Last seen: ${fmtLocalTime(n.last_seen)}<br>
@@ -1137,9 +1169,13 @@ async function loadStatus() {
 
       <button
         onclick="deleteNode('${n.node_id}')"
-        ${n.status === "online" ? "disabled" : ""}
+        ${n.status !== "offline" ? "disabled" : ""}
       >
         Delete node
+      </button>
+
+      <button onclick="wakeNode('${n.node_id}')">
+        Wake
       </button>
 
     </div><br>
@@ -1189,6 +1225,19 @@ async function deleteNode(nodeId) {
 
   if (!res.ok) {
     alert("Failed to delete node");
+    return;
+  }
+
+  await loadStatus();
+}
+
+async function wakeNode(nodeId) {
+  const res = await fetch(`/api/nodes/${nodeId}/wake`, {
+    method: "POST"
+  });
+
+  if (!res.ok) {
+    alert("Failed to wake node");
     return;
   }
 
@@ -1247,7 +1296,7 @@ async function loadNodes() {
 
     div.innerHTML = `
       <b>${n.alias}</b><br>
-      <span class="${n.status}">${n.status}</span><br>
+      <span class="${n.status}">${statusLabel(n.status)}</span><br>
       <small class="muted">${n.ip_address || '-'}</small><br>
       <button onclick="startPreview('${n.node_id}', '${n.ip_address}')">Start preview</button>
       <button onclick="stopPreview('${n.node_id}')">Stop preview</button>
@@ -1255,6 +1304,17 @@ async function loadNodes() {
 
     container.appendChild(div);
   }
+}
+
+function statusLabel(status) {
+  const labels = {
+    ready: "Ready",
+    sleeping: "Sleeping",
+    camera_aim: "Camera Aim",
+    offline: "Offline"
+  };
+
+  return labels[status] || status;
 }
 
 async function startPreview(nodeId, ip) {

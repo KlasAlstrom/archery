@@ -30,8 +30,10 @@ RECORDER_MAX_SEGMENT_AGE_SECONDS = 8
 UPLOAD_RETRY_INTERVAL_SECONDS = 3
 PREVIEW_FRAME_RATE = 10
 PREVIEW_SCALE = "640:-1"
+
+last_trigger_at = time.monotonic()
 ffmpeg_started_at = 0.0
-current_mode = "recording"
+current_mode = "recording"  # recording, preview, sleeping
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -58,6 +60,8 @@ PRE_SECONDS = int(cfg["trigger"]["pre_seconds"])
 POST_SECONDS = int(cfg["trigger"]["post_seconds"])
 SEGMENT_SECONDS = int(cfg["buffer"]["segment_seconds"])
 BUFFER_EXTRA_SECONDS = int(cfg["buffer"].get("extra_seconds", 10))
+POWER_IDLE_TIMEOUT_SECONDS = int(cfg.get("power", {}).get("idle_timeout_seconds", 900))
+WAKE_ON_TRIGGER = bool(cfg.get("power", {}).get("wake_on_trigger", True))
 
 SEGMENT_COUNT = max(
     10,
@@ -95,6 +99,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         asyncio.create_task(monitor_ffmpeg(), name="monitor-ffmpeg"),
         asyncio.create_task(trigger_worker(), name="trigger-worker"),
         asyncio.create_task(heartbeat_worker(), name="heartbeat-worker"),
+        asyncio.create_task(power_worker(), name="power-worker"),
     ]
 
     try:
@@ -112,6 +117,36 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def wake_recording() -> None:
+    global current_mode
+    global ffmpeg_started_at
+    global last_trigger_at
+
+    if current_mode == "recording":
+        return
+
+    stop_preview_process()
+
+    current_mode = "recording"
+    start_ffmpeg()
+
+    ffmpeg_started_at = time.monotonic()
+    last_trigger_at = time.monotonic()
+
+    logger.info("Node woke up; recording started")
+
+
+def sleep_recording() -> None:
+    global current_mode
+
+    if current_mode != "recording":
+        return
+
+    stop_ffmpeg()
+    current_mode = "sleeping"
+    logger.info("Node entered sleep mode")
 
 
 def ensure_directories() -> None:
@@ -350,6 +385,14 @@ async def monitor_ffmpeg() -> None:
         await asyncio.sleep(FFMPEG_HEALTH_CHECK_INTERVAL_SECONDS)
 
 
+def heartbeat_status() -> str:
+    return {
+        "recording": "ready",
+        "preview": "camera_aim",
+        "sleeping": "sleeping",
+    }.get(current_mode, "unknown")
+
+
 async def heartbeat_worker() -> None:
     headers = {"Authorization": f"Bearer {TOKEN}"}
     heartbeat_url = UPLOAD_URL.replace("/api/upload", "/api/heartbeat")
@@ -359,7 +402,7 @@ async def heartbeat_worker() -> None:
             try:
                 data = aiohttp.FormData()
                 data.add_field("node_id", NODE_ID)
-                data.add_field("status", "ok")
+                data.add_field("status", heartbeat_status())
                 data.add_field("ip_address", get_local_ip())
 
                 async with session.post(heartbeat_url, data=data, timeout=5) as response:
@@ -398,6 +441,17 @@ async def build_clip(event_id: str, trigger_segment: str) -> Path:
         return output_file
     finally:
         shutil.rmtree(event_dir, ignore_errors=True)
+
+
+async def power_worker() -> None:
+    while True:
+        if current_mode == "recording":
+            idle_seconds = time.monotonic() - last_trigger_at
+
+            if idle_seconds >= POWER_IDLE_TIMEOUT_SECONDS:
+                sleep_recording()
+
+        await asyncio.sleep(5)
 
 
 def copy_segments_for_clip(segments: list[Path], event_dir: Path) -> list[Path]:
@@ -635,21 +689,35 @@ def offset_segment(segment: Path, offset: int) -> Path:
 
 @app.post("/trigger")
 async def trigger(request: Request) -> dict[str, Any]:
+    global last_trigger_at
+
     body = await parse_trigger_body(request)
     event_id = str(body.get("event_id") or uuid.uuid4())
     created_at = str(body.get("created_at") or datetime.now(timezone.utc).isoformat())
+
+    last_trigger_at = time.monotonic()
+
+    if current_mode == "sleeping":
+        if WAKE_ON_TRIGGER:
+            wake_recording()
+            return {
+                "status": "waking",
+                "event_id": event_id,
+                "clip_created": False,
+                "message": "Node was sleeping; recording restarted",
+            }
+
+        raise HTTPException(status_code=503, detail="Node sleeping")
+
+    if current_mode != "recording":
+        raise HTTPException(status_code=503, detail=f"Node not recording: {current_mode}")
 
     if not buffer_ready():
         raise HTTPException(status_code=503, detail="Video buffer not ready")
 
     trigger_segment = newest_safe_segment()
-    TRIGGER_SEGMENT_OFFSET = int(cfg["trigger"].get("trigger_segment_offset", 0))
 
     if trigger_segment is None:
-        raise HTTPException(status_code=503, detail="Video buffer not ready")
-    trigger_segment = offset_segment(trigger_segment, TRIGGER_SEGMENT_OFFSET)
-
-    if not buffer_ready():
         raise HTTPException(status_code=503, detail="Video buffer not ready")
 
     await trigger_queue.put({
@@ -713,6 +781,12 @@ async def preview_stop() -> dict[str, str]:
         current_mode = "recording"
         start_ffmpeg()
 
+    return {"status": "recording_started"}
+
+
+@app.post("/wake")
+async def wake() -> dict[str, Any]:
+    wake_recording()
     return {"status": "recording_started"}
 
 
