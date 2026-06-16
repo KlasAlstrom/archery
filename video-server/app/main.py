@@ -660,6 +660,11 @@ COMMON_CSS = """
     background: #eeeeee;
   }
 
+  button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
   .primary {
     background: var(--primary);
     color: var(--primary-text);
@@ -1184,9 +1189,12 @@ async function loadStatus() {
         Delete node
       </button>
 
-      <button onclick="wakeNode('${n.node_id}')">
+      <button
+        onclick="wakeNode('${n.node_id}')"
+        ${n.status !== "sleeping" ? "disabled" : ""}
+      >
         Wake
-      </button>
+      </button>      
 
     </div><br>
   `).join('');  
