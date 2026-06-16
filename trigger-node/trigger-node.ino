@@ -104,7 +104,7 @@ void setup() {
   Serial.println("Ready.");
 }
 
-void logAccelValues(const float x, const float y, const float z){
+void logAccelValues(const float x, const float y, const float z, const float impactValue){
   Serial.print("x=");
   Serial.print(x);
   Serial.print(" y=");
@@ -134,7 +134,7 @@ void loop() {
   float y = accel.acceleration.y;
   float z = accel.acceleration.z;
 
-  float impactValue = abs(x) + abs(y) + abs(z);
+  const float impactValue = abs(x) + abs(y) + abs(z);
 
   bool overThreshold = impactValue > SHOT_THRESHOLD;
   bool cooldownPassed = now - lastShotTime >= MIN_SHOT_INTERVAL_MS;
@@ -143,12 +143,12 @@ void loop() {
     lastShotTime = now;
 
     Serial.println("SHOT DETECTED!");
-    logAccelValues(x, y, z);
+    logAccelValues(x, y, z, impactValue);
 
     const bool ok = sendTrigger();
 
     if (ok) {
-      Serial.println("Trigger sent successfully.");
+      Serial.println("Trigger sent su, ccessfully.");
     } else {
       Serial.println("Trigger failed.");
     }
