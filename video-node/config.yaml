@@ -12,7 +12,7 @@ buffer:
   extra_seconds: 10
 
 trigger:
-  pre_seconds: 3
+  pre_seconds: 5
   post_seconds: 3
   trigger_segment_offset: 2
   port: 8080
