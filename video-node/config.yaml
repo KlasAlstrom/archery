@@ -14,7 +14,8 @@ buffer:
 trigger:
   pre_seconds: 5
   post_seconds: 3
-  trigger_segment_offset: 2
+  pre_seconds_delayed: 8
+  post_seconds_delayed: 5
   port: 8080
 
 server:

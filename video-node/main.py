@@ -38,11 +38,12 @@ current_mode = "recording"  # recording, preview, sleeping
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-
 class TriggerEvent(TypedDict):
     event_id: str
     created_at: str
     trigger_segment: str
+    pre_seconds: int
+    post_seconds: int
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict[str, Any]:
@@ -58,6 +59,9 @@ CLIP_DIR = BASE_DIR / "clips"
 
 PRE_SECONDS = int(cfg["trigger"]["pre_seconds"])
 POST_SECONDS = int(cfg["trigger"]["post_seconds"])
+PRE_SECONDS_DELAYED = int(cfg["trigger"].get("pre_seconds_delayed", PRE_SECONDS))
+POST_SECONDS_DELAYED = int(cfg["trigger"].get("post_seconds_delayed", POST_SECONDS))
+
 SEGMENT_SECONDS = int(cfg["buffer"]["segment_seconds"])
 BUFFER_EXTRA_SECONDS = int(cfg["buffer"].get("extra_seconds", 10))
 POWER_IDLE_TIMEOUT_SECONDS = int(cfg.get("power", {}).get("idle_timeout_seconds", 900))
@@ -66,6 +70,7 @@ WAKE_ON_TRIGGER = bool(cfg.get("power", {}).get("wake_on_trigger", True))
 SEGMENT_COUNT = max(
     10,
     (PRE_SECONDS + POST_SECONDS + BUFFER_EXTRA_SECONDS) // SEGMENT_SECONDS,
+    (PRE_SECONDS_DELAYED + POST_SECONDS_DELAYED + BUFFER_EXTRA_SECONDS) // SEGMENT_SECONDS,
 )
 
 UPLOAD_URL = str(cfg["server"]["upload_url"])
@@ -413,12 +418,16 @@ async def heartbeat_worker() -> None:
 
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
 
+async def build_clip(
+    event_id: str,
+    trigger_segment: str,
+    pre_seconds: int,
+    post_seconds: int,
+) -> Path:
+    pre_count = pre_seconds // SEGMENT_SECONDS
+    post_count = post_seconds // SEGMENT_SECONDS
 
-async def build_clip(event_id: str, trigger_segment: str) -> Path:
-    pre_count = PRE_SECONDS // SEGMENT_SECONDS
-    post_count = POST_SECONDS // SEGMENT_SECONDS
-
-    await asyncio.sleep(POST_SECONDS + 0.5)
+    await asyncio.sleep(post_seconds + 0.5)
 
     segments = select_segments_around_trigger_segment(
         trigger_segment_name=trigger_segment,
@@ -501,14 +510,25 @@ def run_ffmpeg_concat(concat_file: Path, output_file: Path) -> None:
         raise RuntimeError("Failed to build MP4 clip")
 
 
-async def upload_clip(event_id: str, clip_path: Path, created_at: str) -> bool:
+async def upload_clip(
+    event_id: str,
+    clip_path: Path,
+    created_at: str,
+    duration_seconds: int,
+) -> bool:
     headers = {"Authorization": f"Bearer {TOKEN}"}
     timeout_at = time.monotonic() + int(cfg["clip"]["max_retry_seconds"])
 
     async with aiohttp.ClientSession(headers=headers) as session:
         while time.monotonic() < timeout_at:
             try:
-                if await try_upload_clip(session, event_id, clip_path, created_at):
+                if await try_upload_clip(
+                    session,
+                    event_id,
+                    clip_path,
+                    created_at,
+                    duration_seconds,
+                ):
                     logger.info("Uploaded clip %s", event_id)
                     return True
             except Exception:
@@ -524,12 +544,13 @@ async def try_upload_clip(
     event_id: str,
     clip_path: Path,
     created_at: str,
+    duration_seconds: int,
 ) -> bool:
     data = aiohttp.FormData()
     data.add_field("node_id", NODE_ID)
     data.add_field("event_id", event_id)
     data.add_field("timestamp", created_at)
-    data.add_field("duration", str(PRE_SECONDS + POST_SECONDS))
+    data.add_field("duration", str(duration_seconds))
 
     with clip_path.open("rb") as file:
         data.add_field(
@@ -554,10 +575,26 @@ async def trigger_worker() -> None:
         try:
             event_id = event["event_id"]
             logger.info("Building clip %s", event_id)
-            clip = await build_clip(event_id, event["trigger_segment"])
+
+            pre_seconds = event["pre_seconds"]
+            post_seconds = event["post_seconds"]
+            duration_seconds = pre_seconds + post_seconds
+
+            clip = await build_clip(
+                event_id,
+                event["trigger_segment"],
+                pre_seconds,
+                post_seconds,
+            )
 
             logger.info("Uploading clip %s", event_id)
-            uploaded = await upload_clip(event_id, clip, event["created_at"])
+            uploaded = await upload_clip(
+                event_id,
+                clip,
+                event["created_at"],
+                duration_seconds,
+            )
+
             if not uploaded:
                 logger.warning("Dropping clip after failed upload: %s", event_id)
 
@@ -687,11 +724,16 @@ def offset_segment(segment: Path, offset: int) -> Path:
     return segments[new_pos]
 
 
-@app.post("/trigger")
-async def trigger(request: Request) -> dict[str, Any]:
+async def queue_trigger(
+    request: Request,
+    pre_seconds: int,
+    post_seconds: int,
+) -> dict[str, Any]:
+
     global last_trigger_at
 
     body = await parse_trigger_body(request)
+
     event_id = str(body.get("event_id") or uuid.uuid4())
     created_at = str(body.get("created_at") or datetime.now(timezone.utc).isoformat())
 
@@ -704,13 +746,9 @@ async def trigger(request: Request) -> dict[str, Any]:
                 "status": "waking",
                 "event_id": event_id,
                 "clip_created": False,
-                "message": "Node was sleeping; recording restarted",
             }
 
         raise HTTPException(status_code=503, detail="Node sleeping")
-
-    if current_mode != "recording":
-        raise HTTPException(status_code=503, detail=f"Node not recording: {current_mode}")
 
     if not buffer_ready():
         raise HTTPException(status_code=503, detail="Video buffer not ready")
@@ -724,6 +762,8 @@ async def trigger(request: Request) -> dict[str, Any]:
         "event_id": event_id,
         "created_at": created_at,
         "trigger_segment": trigger_segment.name,
+        "pre_seconds": pre_seconds,
+        "post_seconds": post_seconds,
     })
 
     return {
@@ -732,6 +772,23 @@ async def trigger(request: Request) -> dict[str, Any]:
         "queue_size": trigger_queue.qsize(),
     }
 
+
+@app.post("/trigger")
+async def trigger(request: Request) -> dict[str, Any]:
+    return await queue_trigger(
+        request=request,
+        pre_seconds=PRE_SECONDS,
+        post_seconds=POST_SECONDS,
+    )
+
+
+@app.post("/trigger_delayed")
+async def trigger_delayed_node(request: Request) -> dict[str, Any]:
+    return await queue_trigger(
+        request=request,
+        pre_seconds=PRE_SECONDS_DELAYED,
+        post_seconds=POST_SECONDS_DELAYED,
+    )
 
 @app.get("/health")
 async def health() -> dict[str, Any]:

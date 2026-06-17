@@ -396,10 +396,11 @@ async def trigger_node(
     target: dict[str, str],
     event_id: str,
     created_at: str,
+    endpoint: str,
 ) -> dict[str, Any]:
     try:
         response = await client.post(
-            target["url"],
+            f"http://{target['ip_address']}:8080/{endpoint}",
             json={"event_id": event_id, "created_at": created_at},
         )
         return {
@@ -418,7 +419,9 @@ async def trigger_node(
 
 
 @app.post("/api/trigger-all")
-async def trigger_all() -> dict[str, Any]:
+async def trigger_all(
+    endpoint: str = "trigger",
+) -> dict[str, Any]:
     shared_event_id = str(uuid.uuid4())
     created_at = utc_now().isoformat()
     targets: list[dict[str, str]] = []
@@ -438,10 +441,16 @@ async def trigger_all() -> dict[str, Any]:
     async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
         results = await asyncio.gather(
             *[
-                trigger_node(client, target, shared_event_id, created_at)
+                trigger_node(
+                    client,
+                    target,
+                    shared_event_id,
+                    created_at,
+                    endpoint,
+                )
                 for target in targets
             ]
-        )
+        )        
 
 
     logger.info(
@@ -469,7 +478,9 @@ async def trigger_delayed(request: Request) -> dict[str, Any]:
 
     await asyncio.sleep(delay_seconds)
 
-    return await trigger_all()
+    return await trigger_all(
+        endpoint="trigger_delayed"
+    )
 
 
 @app.get("/api/events")
