@@ -459,6 +459,19 @@ async def trigger_all() -> dict[str, Any]:
     }
 
 
+@app.post("/api/trigger-delayed")
+async def trigger_delayed(request: Request) -> dict[str, Any]:
+    body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
+
+    delay_seconds = int(body.get("delay_seconds", 10))
+
+    logger.info("trigger_delayed delay=%s", delay_seconds)
+
+    await asyncio.sleep(delay_seconds)
+
+    return await trigger_all()
+
+
 @app.get("/api/events")
 def list_events(limit: int = 100, offset: int = 0, node_id: str | None = None) -> dict[str, Any]:
     with db_session() as session:
@@ -816,12 +829,22 @@ INDEX_HTML = """<!doctype html>
   <div>
     <div class="panel">
       <h2>Nodes</h2>
-      <div class="panel-actions">
-        <button class="primary" onclick="triggerAllNodes()">Trigger All Nodes</button>
+      <div class="panel-actions" style="flex-direction:row; align-items:center;">
+        <button class="primary" onclick="triggerDelayed()">
+          Trigger Delayed
+        </button>
+
+        <select id="triggerDelay" style="width:90px;">
+          <option value="0">0 s</option>
+          <option value="5">5 s</option>
+          <option value="10" selected>10 s</option>
+          <option value="15">15 s</option>
+          <option value="20">20 s</option>
+        </select>
       </div>
+
       <div id="nodes">Loading...</div>
     </div>
-
     <br>
 
     <div class="panel">
@@ -1009,14 +1032,21 @@ function playClip(e, videoId, nodeId, localTime) {
   player.play();
 }
 
-async function triggerAllNodes() {
+async function triggerDelayed() {
   const status = document.getElementById('triggerStatus');
+  const delay = parseInt(document.getElementById('triggerDelay').value);
 
-  status.innerText = 'Triggering...';
+  status.innerText = `Triggering in ${delay}s...`;
 
   try {
-    const res = await fetch('/api/trigger-all', {
-      method: 'POST'
+    const res = await fetch('/api/trigger-delayed', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        delay_seconds: delay
+      })
     });
 
     const data = await res.json();
