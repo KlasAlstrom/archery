@@ -1001,6 +1001,9 @@ function maybeAutoPlay(events) {
     newestMatchingClip.created_at || newestMatchingEvent.created_at
   );
 
+  const player = document.getElementById('player');
+  player.loop = true;
+
   playClip(
     { stopPropagation: () => {} },
     newestMatchingClip.id,
@@ -1107,6 +1110,9 @@ function saveAutoPlaySelection() {
   sessionStorage.setItem('autoPlayNodeId', selectedAutoPlayNodeId());
   newestSeenVideoId = null;
   autoPlayInitialized = false;
+
+  const player = document.getElementById('player');
+  player.loop = selectedAutoPlayNodeId() !== "";
 }
 
 function restoreAutoPlaySelection() {
@@ -1120,6 +1126,7 @@ function playClip(e, videoId, nodeId, localTime) {
   e.stopPropagation();
 
   const player = document.getElementById('player');
+  player.loop = selectedAutoPlayNodeId() !== "";
   player.src = `/api/video/${videoId}`;
 
   document.getElementById('playerTitle').innerText =
