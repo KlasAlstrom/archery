@@ -863,7 +863,12 @@ INDEX_HTML = """<!doctype html>
       <select id="nodeFilter" onchange="loadVideos(true)">
         <option value="">All nodes</option>
       </select>
-      <button onclick="loadVideos()">Refresh</button>
+
+      <select id="autoPlayNode" onchange="saveAutoPlaySelection()">
+        <option value="">Auto play: None</option>
+      </select>
+
+      <button onclick="loadVideos()">Refresh</button>      
       <div id="events"></div>
     </div>
   </div>
@@ -886,6 +891,8 @@ let offset = 0;
 const limit = 100;
 let knownNodes = new Set();
 let nodeAliases = {};
+let newestSeenVideoId = null;
+let autoPlayInitialized = false;
 
 function fmtSize(bytes) {
   return Math.round(bytes / 1024 / 1024 * 10) / 10 + " MB";
@@ -923,6 +930,7 @@ async function loadNodes() {
   container.innerHTML = '';
 
   const filter = document.getElementById('nodeFilter');
+  const autoPlaySelect = document.getElementById('autoPlayNode');
 
   nodeAliases = {};
   for (const n of nodes) {
@@ -934,12 +942,71 @@ async function loadNodes() {
 
     if (!knownNodes.has(n.node_id)) {
       knownNodes.add(n.node_id);
+
       const opt = document.createElement('option');
       opt.value = n.node_id;
       opt.textContent = n.alias;
       filter.appendChild(opt);
+
+      const autoOpt = document.createElement('option');
+      autoOpt.value = n.node_id;
+      autoOpt.textContent = `Auto play: ${n.alias}`;
+      autoPlaySelect.appendChild(autoOpt);
+    }    
+  }
+  restoreAutoPlaySelection();
+}
+
+function maybeAutoPlay(events) {
+  const autoPlayNodeId = selectedAutoPlayNodeId();
+
+  if (!autoPlayNodeId || events.length === 0) {
+    return;
+  }
+
+  let newestMatchingClip = null;
+  let newestMatchingEvent = null;
+
+  for (const ev of events) {
+    for (const clip of ev.clips) {
+      if (clip.node_id === autoPlayNodeId) {
+        newestMatchingClip = clip;
+        newestMatchingEvent = ev;
+        break;
+      }
+    }
+
+    if (newestMatchingClip) {
+      break;
     }
   }
+
+  if (!newestMatchingClip) {
+    return;
+  }
+
+  if (!autoPlayInitialized) {
+    newestSeenVideoId = newestMatchingClip.id;
+    autoPlayInitialized = true;
+    return;
+  }
+
+  if (newestMatchingClip.id === newestSeenVideoId) {
+    return;
+  }
+
+  newestSeenVideoId = newestMatchingClip.id;
+
+  const localTime = fmtLocalTime(
+    newestMatchingClip.created_at || newestMatchingEvent.created_at
+  );
+
+  playClip(
+    { stopPropagation: () => {} },
+    newestMatchingClip.id,
+    newestMatchingClip.node_id,
+    localTime,
+  );
 }
 
 async function loadVideos(resetOffset = false) {
@@ -1029,6 +1096,24 @@ async function loadVideos(resetOffset = false) {
   nav.appendChild(prev);
   nav.appendChild(next);
   container.appendChild(nav);
+  maybeAutoPlay(events);
+}
+
+function selectedAutoPlayNodeId() {
+  return document.getElementById('autoPlayNode').value;
+}
+
+function saveAutoPlaySelection() {
+  sessionStorage.setItem('autoPlayNodeId', selectedAutoPlayNodeId());
+  newestSeenVideoId = null;
+  autoPlayInitialized = false;
+}
+
+function restoreAutoPlaySelection() {
+  const saved = sessionStorage.getItem('autoPlayNodeId');
+  if (saved !== null) {
+    document.getElementById('autoPlayNode').value = saved;
+  }
 }
 
 function playClip(e, videoId, nodeId, localTime) {
