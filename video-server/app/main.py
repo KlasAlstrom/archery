@@ -1107,19 +1107,27 @@ function selectedAutoPlayNodeId() {
 }
 
 function saveAutoPlaySelection() {
-  sessionStorage.setItem('autoPlayNodeId', selectedAutoPlayNodeId());
-  newestSeenVideoId = null;
-  autoPlayInitialized = false;
+  const nodeId = selectedAutoPlayNodeId();
 
-  const player = document.getElementById('player');
-  player.loop = selectedAutoPlayNodeId() !== "";
+  const url = new URL(window.location);
+
+  if (nodeId) {
+    url.searchParams.set('autoplay', nodeId);
+  } else {
+    url.searchParams.delete('autoplay');
+  }
+
+  history.replaceState({}, '', url);
+}
+
+function autoPlayNodeFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('autoplay') || '';
 }
 
 function restoreAutoPlaySelection() {
-  const saved = sessionStorage.getItem('autoPlayNodeId');
-  if (saved !== null) {
-    document.getElementById('autoPlayNode').value = saved;
-  }
+  document.getElementById('autoPlayNode').value =
+    autoPlayNodeFromUrl();
 }
 
 function playClip(e, videoId, nodeId, localTime) {
