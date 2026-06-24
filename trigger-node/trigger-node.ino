@@ -1,7 +1,7 @@
 #include <Wire.h>
 #include <WiFi.h>
-#include <esp_task_wdt.h>
 #include <HTTPClient.h>
+#include <esp_task_wdt.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
 
@@ -12,19 +12,42 @@ const char* TRIGGER_URL   = "http://192.168.60.1/api/trigger-all";
 
 // ---------- MPU6050 ----------
 Adafruit_MPU6050 mpu;
-
-// Watchdog
-const int WATCHDOG_TIMEOUT_SECONDS = 10;
+const uint8_t MPU_ADDRESS = 0x68;
 
 // ---------- Shot detection ----------
-const float SHOT_THRESHOLD = 80.0;   // Tune this value
+const float SHOT_THRESHOLD = 80.0;
 const unsigned long MIN_SHOT_INTERVAL_MS = 1000;
 
-unsigned long lastShotTime = 0;
-
 // ---------- Timing ----------
-const unsigned long SAMPLE_INTERVAL_MS = 10; // 100 Hz sampling
+const unsigned long SAMPLE_INTERVAL_MS = 10;
+
+// ---------- Health ----------
+const int MAX_MPU_FAILURES = 5;
+
+unsigned long lastShotTime = 0;
 unsigned long lastSampleTime = 0;
+int mpuFailures = 0;
+
+void feedWatchdog() {
+  esp_task_wdt_reset();
+}
+
+void setupWatchdog() {
+  // The ESP32 Arduino core often initializes the watchdog before setup().
+  // We only add the Arduino loop task to the existing watchdog.
+  esp_err_t result = esp_task_wdt_add(NULL);
+
+  if (result == ESP_OK) {
+    Serial.println("Watchdog added to loop task.");
+  } else {
+    Serial.printf("Watchdog add returned: %d\n", result);
+  }
+}
+
+bool isMPUConnected() {
+  Wire.beginTransmission(MPU_ADDRESS);
+  return Wire.endTransmission() == 0;
+}
 
 void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
@@ -39,8 +62,10 @@ void connectWiFi() {
 
   unsigned long startAttempt = millis();
 
-  while (WiFi.status() != WL_CONNECTED && millis() - startAttempt < 15000) {
-    delay(500);
+  while (WiFi.status() != WL_CONNECTED &&
+         millis() - startAttempt < 15000) {
+    feedWatchdog();
+    delay(250);
     Serial.print(".");
   }
 
@@ -64,11 +89,16 @@ bool sendTrigger() {
     return false;
   }
 
+  feedWatchdog();
+
   HTTPClient http;
+  http.setTimeout(1500);
   http.begin(TRIGGER_URL);
   http.addHeader("Content-Type", "application/json");
 
   int httpCode = http.POST("{}");
+
+  feedWatchdog();
 
   Serial.print("POST response code: ");
   Serial.println(httpCode);
@@ -81,43 +111,38 @@ bool sendTrigger() {
 void setupMPU6050() {
   Wire.begin();
 
-  if (!mpu.begin(0x68, &Wire)) {
-    Serial.println("MPU6050 not found!");
-    while (true) {
-      delay(1000);
+  const int MAX_RETRIES = 5;
+
+  for (int attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    feedWatchdog();
+
+    Serial.printf("Initializing MPU6050 (attempt %d/%d)\n",
+                  attempt, MAX_RETRIES);
+
+    if (mpu.begin(MPU_ADDRESS, &Wire)) {
+      Serial.println("MPU6050 found.");
+
+      mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
+      mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+      mpu.setFilterBandwidth(MPU6050_BAND_94_HZ);
+
+      return;
+    }
+
+    Serial.println("MPU6050 not found.");
+
+    for (int i = 0; i < 10; i++) {
+      feedWatchdog();
+      delay(100);
     }
   }
 
-  Serial.println("MPU6050 found.");
-
-  mpu.setAccelerometerRange(MPU6050_RANGE_16_G);
-  mpu.setGyroRange(MPU6050_RANGE_500_DEG);
-  mpu.setFilterBandwidth(MPU6050_BAND_94_HZ);
+  Serial.println("MPU6050 initialization failed. Restarting...");
+  delay(500);
+  ESP.restart();
 }
 
-void setup() {
-  Serial.begin(115200);
-
-  esp_task_wdt_config_t wdt_config = {
-  .timeout_ms = WATCHDOG_TIMEOUT_SECONDS * 1000,
-  .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
-  .trigger_panic = true
-};
-
-esp_task_wdt_init(&wdt_config);
-esp_task_wdt_add(NULL);   // Watch current loop task
-  delay(2000);
-
-  Serial.println();
-  Serial.println("Archery shot detector starting...");
-
-  setupMPU6050();
-  connectWiFi();
-
-  Serial.println("Ready.");
-}
-
-void logAccelValues(const float x, const float y, const float z, const float impactValue){
+void logAccelValues(float x, float y, float z, float impactValue) {
   Serial.print("x=");
   Serial.print(x);
   Serial.print(" y=");
@@ -128,27 +153,58 @@ void logAccelValues(const float x, const float y, const float z, const float imp
   Serial.println(impactValue);
 }
 
+void setup() {
+  Serial.begin(115200);
+  delay(2000);
+
+  setupWatchdog();
+
+  Serial.println();
+  Serial.println("Archery shot detector starting...");
+
+  setupMPU6050();
+  connectWiFi();
+
+  Serial.println("Ready.");
+}
+
 void loop() {
+  feedWatchdog();
+
   unsigned long now = millis();
-  esp_task_wdt_reset();
 
   if (now - lastSampleTime < SAMPLE_INTERVAL_MS) {
+    delay(1);
     return;
   }
 
   lastSampleTime = now;
 
-  sensors_event_t accel;
-  sensors_event_t gyro;
-  sensors_event_t temp;
+  if (!isMPUConnected()) {
+    mpuFailures++;
 
+    Serial.printf("MPU6050 communication failure %d/%d\n",
+                  mpuFailures, MAX_MPU_FAILURES);
+
+    if (mpuFailures >= MAX_MPU_FAILURES) {
+      Serial.println("MPU6050 lost. Restarting...");
+      delay(100);
+      ESP.restart();
+    }
+
+    return;
+  }
+
+  mpuFailures = 0;
+
+  sensors_event_t accel, gyro, temp;
   mpu.getEvent(&accel, &gyro, &temp);
 
   float x = accel.acceleration.x;
   float y = accel.acceleration.y;
   float z = accel.acceleration.z;
 
-  const float impactValue = abs(x) + abs(y) + abs(z);
+  float impactValue = fabs(x) + fabs(y) + fabs(z);
 
   bool overThreshold = impactValue > SHOT_THRESHOLD;
   bool cooldownPassed = now - lastShotTime >= MIN_SHOT_INTERVAL_MS;
@@ -159,10 +215,10 @@ void loop() {
     Serial.println("SHOT DETECTED!");
     logAccelValues(x, y, z, impactValue);
 
-    const bool ok = sendTrigger();
+    bool ok = sendTrigger();
 
     if (ok) {
-      Serial.println("Trigger sent su, ccessfully.");
+      Serial.println("Trigger sent successfully.");
     } else {
       Serial.println("Trigger failed.");
     }
