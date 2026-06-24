@@ -1,5 +1,6 @@
 #include <Wire.h>
 #include <WiFi.h>
+#include <esp_task_wdt.h>
 #include <HTTPClient.h>
 #include <Adafruit_MPU6050.h>
 #include <Adafruit_Sensor.h>
@@ -11,6 +12,9 @@ const char* TRIGGER_URL   = "http://192.168.60.1/api/trigger-all";
 
 // ---------- MPU6050 ----------
 Adafruit_MPU6050 mpu;
+
+// Watchdog
+const int WATCHDOG_TIMEOUT_SECONDS = 10;
 
 // ---------- Shot detection ----------
 const float SHOT_THRESHOLD = 80.0;   // Tune this value
@@ -93,6 +97,15 @@ void setupMPU6050() {
 
 void setup() {
   Serial.begin(115200);
+
+  esp_task_wdt_config_t wdt_config = {
+  .timeout_ms = WATCHDOG_TIMEOUT_SECONDS * 1000,
+  .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+  .trigger_panic = true
+};
+
+esp_task_wdt_init(&wdt_config);
+esp_task_wdt_add(NULL);   // Watch current loop task
   delay(2000);
 
   Serial.println();
@@ -117,6 +130,7 @@ void logAccelValues(const float x, const float y, const float z, const float imp
 
 void loop() {
   unsigned long now = millis();
+  esp_task_wdt_reset();
 
   if (now - lastSampleTime < SAMPLE_INTERVAL_MS) {
     return;
