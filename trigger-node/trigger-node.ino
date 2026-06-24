@@ -9,6 +9,8 @@
 const char* WIFI_SSID     = "archeryNet";
 const char* WIFI_PASSWORD = "archery2026";
 const char* TRIGGER_URL   = "http://192.168.60.1/api/trigger-all";
+unsigned long lastWiFiReconnectAttempt = 0;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 5000;
 
 // ---------- MPU6050 ----------
 Adafruit_MPU6050 mpu;
@@ -49,6 +51,55 @@ bool isMPUConnected() {
   return Wire.endTransmission() == 0;
 }
 
+void maintainWiFi() {
+  if (WiFi.status() == WL_CONNECTED) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastWiFiReconnectAttempt < WIFI_RECONNECT_INTERVAL_MS) {
+    return;
+  }
+
+  lastWiFiReconnectAttempt = now;
+
+  Serial.println("WiFi not connected. Forcing reconnect...");
+
+  WiFi.disconnect(false);   // disconnect, but keep credentials
+  delay(100);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void WiFiEvent(WiFiEvent_t event, arduino_event_info_t info) {
+
+    switch (event) {
+
+        case ARDUINO_EVENT_WIFI_STA_CONNECTED:
+            Serial.println("WiFi connected to AP.");
+            break;
+
+        case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+            Serial.print("WiFi connected. IP address: ");
+            Serial.println(WiFi.localIP());
+            break;
+
+        case ARDUINO_EVENT_WIFI_STA_DISCONNECTED: {
+            wifi_err_reason_t reason =
+                static_cast<wifi_err_reason_t>(info.wifi_sta_disconnected.reason);
+
+            Serial.printf("WiFi disconnected, reason: %s (%d)\n",
+                          WiFi.disconnectReasonName(reason),
+                          info.wifi_sta_disconnected.reason);
+            }
+            break;
+
+        default:
+            break;
+    }
+}
+
 void connectWiFi() {
   if (WiFi.status() == WL_CONNECTED) {
     return;
@@ -57,13 +108,18 @@ void connectWiFi() {
   Serial.print("Connecting to WiFi: ");
   Serial.println(WIFI_SSID);
 
+  WiFi.onEvent(WiFiEvent);
+
   WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(true);
+  WiFi.persistent(false);
+
   WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
 
   unsigned long startAttempt = millis();
 
   while (WiFi.status() != WL_CONNECTED &&
-         millis() - startAttempt < 15000) {
+         millis() - startAttempt < 000) {
     feedWatchdog();
     delay(250);
     Serial.print(".");
@@ -89,21 +145,23 @@ bool sendTrigger() {
     return false;
   }
 
-  feedWatchdog();
+  esp_task_wdt_delete(NULL);   // pause watchdog monitoring for this task
 
   HTTPClient http;
-  http.setTimeout(1500);
+  http.setConnectTimeout(1000);
+  http.setTimeout(1000);
+
   http.begin(TRIGGER_URL);
   http.addHeader("Content-Type", "application/json");
 
   int httpCode = http.POST("{}");
 
-  feedWatchdog();
-
   Serial.print("POST response code: ");
   Serial.println(httpCode);
 
   http.end();
+
+  esp_task_wdt_add(NULL);      // re-enable watchdog monitoring
 
   return httpCode > 0 && httpCode < 400;
 }
@@ -170,6 +228,8 @@ void setup() {
 
 void loop() {
   feedWatchdog();
+
+  maintainWiFi();
 
   unsigned long now = millis();
 
