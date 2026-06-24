@@ -35,6 +35,7 @@ VIDEO_RETENTION = timedelta(days=30)
 NODE_REQUEST_TIMEOUT = 5.0
 THUMBNAIL_TIMESTAMP = "00:00:02"
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("video-server")
 
@@ -893,6 +894,8 @@ let knownNodes = new Set();
 let nodeAliases = {};
 let newestSeenVideoId = null;
 let autoPlayInitialized = false;
+let autoPlayLoopCount = 0;
+const AUTO_PLAY_MAX_LOOPS = 5;
 
 function fmtSize(bytes) {
   return Math.round(bytes / 1024 / 1024 * 10) / 10 + " MB";
@@ -1002,7 +1005,7 @@ function maybeAutoPlay(events) {
   );
 
   const player = document.getElementById('player');
-  player.loop = true;
+  autoPlayLoopCount = 0;
 
   playClip(
     { stopPropagation: () => {} },
@@ -1134,7 +1137,7 @@ function playClip(e, videoId, nodeId, localTime) {
   e.stopPropagation();
 
   const player = document.getElementById('player');
-  player.loop = selectedAutoPlayNodeId() !== "";
+  player.loop = false;
   player.src = `/api/video/${videoId}`;
 
   document.getElementById('playerTitle').innerText =
@@ -1229,6 +1232,23 @@ async function refreshAll() {
 }
 
 refreshAll();
+document.getElementById('player').addEventListener('ended', () => {
+  const autoPlayNodeId = selectedAutoPlayNodeId();
+
+  if (!autoPlayNodeId) {
+    return;
+  }
+
+  autoPlayLoopCount++;
+
+  if (autoPlayLoopCount >= AUTO_PLAY_MAX_LOOPS) {
+    return;
+  }
+
+  const player = document.getElementById('player');
+  player.currentTime = 0;
+  player.play();
+});
 setInterval(refreshAll, 10000);
 </script>
 </body>
