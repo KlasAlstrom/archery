@@ -846,10 +846,10 @@ INDEX_HTML = """<!doctype html>
 <div class="layout">
   <div>
     <div class="panel">
-      <h2>Nodes</h2>
+      <h2>Cam Nodes</h2>
       <div class="panel-actions" style="flex-direction:row; align-items:center;">
         <button class="primary" onclick="triggerDelayed()">
-          Trigger Delayed
+          Trigg Delayed
         </button>
 
         <select id="triggerDelay" style="width:90px;">
@@ -946,7 +946,10 @@ async function loadNodes() {
     nodeAliases[n.node_id] = n.alias;
     const div = document.createElement('div');
     div.className = 'node-row';
-    div.innerHTML = `${n.alias}: <span class="${n.status}">${statusLabel(n.status)}</span><br><small>Last seen: ${fmtLocalTime(n.last_seen)}</small>`;
+    div.innerHTML = `
+      <b>${n.alias}</b>:
+      <span class="${n.status}">${statusLabel(n.status)}</span>
+    `;    
     container.appendChild(div);
 
     if (!knownNodes.has(n.node_id)) {
@@ -1281,12 +1284,7 @@ STATUS_HTML = """<!doctype html>
 
 <div class="status-layout">
   <div class="panel">
-    <h2>Storage</h2>
-    <div id="storage">Loading...</div>
-  </div>
-
-  <div class="panel">
-    <h2>Nodes</h2>
+    <h2>Cam Nodes</h2>
     <div id="nodes">Loading...</div>
   </div>
 
@@ -1294,6 +1292,7 @@ STATUS_HTML = """<!doctype html>
     <h2>Videos</h2>
     <div id="videos">Loading...</div>
   </div>
+
 </div>
 
 <script>
@@ -1325,20 +1324,21 @@ async function loadStatus() {
 
   const usedPercent = Math.round(s.storage.used_bytes / s.storage.total_bytes * 1000) / 10;
 
-  document.getElementById('storage').innerHTML = `
-    Used: <b>${fmtSize(s.storage.used_bytes)}</b><br>
-    Free: <b>${fmtSize(s.storage.free_bytes)}</b><br>
-    Total: <b>${fmtSize(s.storage.total_bytes)}</b><br>
-    Used percent: <b>${usedPercent}%</b>
-  `;
-
   document.getElementById('nodes').innerHTML = s.nodes.map(n => `
     <div>
       <b>${n.alias}</b>
-      <span class="${n.status}">${statusLabel(n.status)}</span><br>
-      Real ID: <small>${n.node_id}</small><br>
-      IP: ${n.ip_address || "-"}<br>
-      Last seen: ${fmtLocalTime(n.last_seen)}<br>
+      <span class="${n.status}">${statusLabel(n.status)}</span>
+      <small class="muted" style="margin-left:12px;">
+        Last seen: ${fmtLocalTime(n.last_seen)}
+      </small><br>
+
+      <small class="muted">
+        Real ID: ${n.node_id}
+      </small>
+
+      <small class="muted" style="margin-left:12px;">
+        IP: ${n.ip_address || "-"}
+      </small><br>    
   
       <input
         id="alias-${n.node_id}"
@@ -1371,6 +1371,8 @@ async function loadStatus() {
   
   document.getElementById('videos').innerHTML = `
     Stored clips: <b>${s.video_count}</b><br>
+    Used: <b>${fmtSize(s.storage.used_bytes)}</b>
+    Free: <b>${fmtSize(s.storage.free_bytes)}</b><br>
     Latest upload: <b>${fmtLocalTime(s.latest_upload)}</b>
   `;
 }
@@ -1463,7 +1465,7 @@ AIM_HTML = """<!doctype html>
 
 <div class="aim-layout">
   <div class="panel">
-    <h2>Nodes</h2>
+    <h2>Cam Nodes</h2>
     <div id="nodes">Loading...</div>
   </div>
 
@@ -1486,12 +1488,19 @@ async function loadNodes() {
     div.className = 'node-row';
 
     div.innerHTML = `
-      <b>${n.alias}</b><br>
-      <span class="${n.status}">${statusLabel(n.status)}</span><br>
-      <small class="muted">${n.ip_address || '-'}</small><br>
-      <button onclick="startPreview('${n.node_id}', '${n.ip_address}')">Start preview</button>
-      <button onclick="stopPreview('${n.node_id}')">Stop preview</button>
-    `;
+      <b>${n.alias}</b>
+      <span class="${n.status}" style="margin-left:12px;">
+        ${statusLabel(n.status)}
+      </span><br>
+
+      <button onclick="startPreview('${n.node_id}', '${n.ip_address}')">
+        Start preview
+      </button>
+
+      <button onclick="stopPreview('${n.node_id}')">
+        Stop preview
+      </button>
+    `;    
 
     container.appendChild(div);
   }
