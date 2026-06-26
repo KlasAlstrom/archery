@@ -1,18 +1,20 @@
 """FastAPI video event server.
 
-This module receives MP4 clips from camera nodes, stores them on disk, tracks
-metadata in SQLAlchemy, and exposes a small web UI for browsing, status, and
-camera aiming.
+Receives MP4 clips from camera nodes, stores them on disk, tracks metadata in
+SQLAlchemy, and exposes a web UI for video events and system status.
+
+Camera Aim has been removed. Live view for auto-play now uses each node's /live
+endpoint, which does not stop node recording.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import shutil
 import subprocess
 import uuid
-import asyncio
 from collections import OrderedDict
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
@@ -20,7 +22,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 import httpx
-from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile, Request
+from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 from sqlalchemy import BigInteger, Column, DateTime, Integer, String, create_engine
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
@@ -34,7 +36,6 @@ NODE_ONLINE_WINDOW = timedelta(seconds=25)
 VIDEO_RETENTION = timedelta(days=30)
 NODE_REQUEST_TIMEOUT = 5.0
 THUMBNAIL_TIMESTAMP = "00:00:02"
-
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("video-server")
@@ -116,7 +117,6 @@ def is_node_online(node: Node, now: datetime | None = None) -> bool:
 
 def node_to_dict(node: Node, now: datetime | None = None) -> dict[str, Any]:
     online = is_node_online(node, now)
-
     return {
         "node_id": node.node_id,
         "alias": node.alias or node.node_id,
@@ -127,12 +127,23 @@ def node_to_dict(node: Node, now: datetime | None = None) -> dict[str, Any]:
     }
 
 
+def video_to_dict(video: Video) -> dict[str, Any]:
+    return {
+        "id": video.id,
+        "node_id": video.node_id,
+        "event_id": video.event_id,
+        "created_at": utc_iso(video.created_at),
+        "uploaded_at": utc_iso(video.uploaded_at),
+        "duration_seconds": video.duration_seconds,
+        "filesize_bytes": video.filesize_bytes,
+        "has_thumbnail": bool(video.thumbnail_path),
+    }
+
+
 def validate_upload(video: UploadFile) -> None:
     filename = video.filename or ""
-
     if not filename.lower().endswith(".mp4"):
         raise HTTPException(status_code=400, detail="Only MP4 files are allowed")
-
     if video.content_type != "video/mp4":
         raise HTTPException(status_code=400, detail="Invalid content type")
 
@@ -146,7 +157,6 @@ def create_storage_paths(node_id: str, created_at: datetime, video_id: str) -> t
 def save_upload(video: UploadFile, output_path: Path, tmp_path: Path) -> int:
     with tmp_path.open("wb") as file_handle:
         shutil.copyfileobj(video.file, file_handle)
-
     tmp_path.rename(output_path)
     return output_path.stat().st_size
 
@@ -155,7 +165,6 @@ def validate_file_size(path: Path, size_bytes: int) -> None:
     if size_bytes == 0:
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=400, detail="Empty video file")
-
     if size_bytes > MAX_UPLOAD_BYTES:
         path.unlink(missing_ok=True)
         raise HTTPException(status_code=413, detail="Video too large")
@@ -177,7 +186,6 @@ def generate_thumbnail(video_path: Path, thumbnail_path: Path) -> bool:
         "2",
         str(thumbnail_path),
     ]
-
     result = subprocess.run(command, check=False)
     return result.returncode == 0
 
@@ -251,13 +259,7 @@ async def upload_video(
             )
             session.commit()
 
-        logger.info(
-            "upload_ok video_id=%s event_id=%s node_id=%s size=%s",
-            video_id,
-            event_id,
-            node_id,
-            filesize,
-        )
+        logger.info("upload_ok video_id=%s event_id=%s node_id=%s size=%s", video_id, event_id, node_id, filesize)
         return {"status": "ok", "video_id": video_id, "filesize": filesize}
     except Exception:
         tmp_path.unlink(missing_ok=True)
@@ -265,40 +267,28 @@ async def upload_video(
 
 
 @app.post("/api/nodes/{node_id}/alias")
-async def update_node_alias(
-    node_id: str,
-    request: Request,
-) -> dict[str, Any]:
+async def update_node_alias(node_id: str, request: Request) -> dict[str, Any]:
     body = await request.json()
     alias = str(body.get("alias", "")).strip()
-
     if not alias:
         raise HTTPException(status_code=400, detail="Alias may not be empty")
 
     with db_session() as session:
         node = session.query(Node).filter(Node.node_id == node_id).first()
-
         if not node:
             raise HTTPException(status_code=404, detail="Node not found")
-
         node.alias = alias
         session.commit()
 
-    return {
-        "status": "ok",
-        "node_id": node_id,
-        "alias": alias,
-    }
+    return {"status": "ok", "node_id": node_id, "alias": alias}
 
 
 @app.get("/api/videos")
 def list_videos(limit: int = 100, offset: int = 0, node_id: str | None = None) -> dict[str, Any]:
     with db_session() as session:
         query = session.query(Video).order_by(Video.created_at.desc())
-
         if node_id:
             query = query.filter(Video.node_id == node_id)
-
         return {
             "total": query.count(),
             "limit": limit,
@@ -312,11 +302,21 @@ def get_video(video_id: str) -> FileResponse:
     with db_session() as session:
         video = get_video_or_404(session, video_id)
         path = Path(video.storage_path)
-
     if not path.exists():
         raise HTTPException(status_code=404, detail="File missing")
-
     return FileResponse(path, media_type="video/mp4", filename=f"{video_id}.mp4")
+
+
+@app.get("/api/thumbnail/{video_id}")
+def get_thumbnail(video_id: str) -> FileResponse:
+    with db_session() as session:
+        video = get_video_or_404(session, video_id)
+        if not video.thumbnail_path:
+            raise HTTPException(status_code=404, detail="Thumbnail not found")
+        thumbnail = Path(video.thumbnail_path)
+    if not thumbnail.exists():
+        raise HTTPException(status_code=404, detail="Thumbnail file missing")
+    return FileResponse(thumbnail, media_type="image/jpeg")
 
 
 @app.post("/api/heartbeat")
@@ -330,7 +330,6 @@ def heartbeat(
 
     with db_session() as session:
         node = session.query(Node).filter(Node.node_id == node_id).first()
-
         if node is None:
             session.add(Node(
                 node_id=node_id,
@@ -343,7 +342,6 @@ def heartbeat(
             node.ip_address = ip_address
             node.last_seen = utc_now()
             node.status = status
-
         session.commit()
 
     return {"status": "ok"}
@@ -365,31 +363,15 @@ def cleanup_old_videos(authorization: str | None = Header(default=None)) -> dict
 
     with db_session() as session:
         videos = session.query(Video).filter(Video.created_at < cutoff).all()
-
         for video in videos:
             delete_file(Path(video.storage_path))
             delete_file(Path(video.thumbnail_path) if video.thumbnail_path else None)
             session.delete(video)
             deleted += 1
-
         session.commit()
 
     logger.info("cleanup_deleted count=%s", deleted)
     return {"status": "ok", "deleted": deleted}
-
-
-@app.get("/api/thumbnail/{video_id}")
-def get_thumbnail(video_id: str) -> FileResponse:
-    with db_session() as session:
-        video = get_video_or_404(session, video_id)
-        if not video.thumbnail_path:
-            raise HTTPException(status_code=404, detail="Thumbnail not found")
-        thumbnail = Path(video.thumbnail_path)
-
-    if not thumbnail.exists():
-        raise HTTPException(status_code=404, detail="Thumbnail file missing")
-
-    return FileResponse(thumbnail, media_type="image/jpeg")
 
 
 async def trigger_node(
@@ -420,9 +402,7 @@ async def trigger_node(
 
 
 @app.post("/api/trigger-all")
-async def trigger_all(
-    endpoint: str = "trigger",
-) -> dict[str, Any]:
+async def trigger_all(endpoint: str = "trigger") -> dict[str, Any]:
     shared_event_id = str(uuid.uuid4())
     created_at = utc_now().isoformat()
     targets: list[dict[str, str]] = []
@@ -431,57 +411,32 @@ async def trigger_all(
         now = utc_now()
         for node in session.query(Node).all():
             if node.ip_address and is_node_online(node, now):
-                targets.append(
-                    {
-                        "node_id": node.node_id,
-                        "ip_address": node.ip_address,
-                        "url": f"http://{node.ip_address}:8080/trigger",
-                    }
-                )
+                targets.append({"node_id": node.node_id, "ip_address": node.ip_address})
 
     async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
-        results = await asyncio.gather(
-            *[
-                trigger_node(
-                    client,
-                    target,
-                    shared_event_id,
-                    created_at,
-                    endpoint,
-                )
-                for target in targets
-            ]
-        )        
-
+        results = await asyncio.gather(*[
+            trigger_node(client, target, shared_event_id, created_at, endpoint)
+            for target in targets
+        ])
 
     logger.info(
-        "trigger_all event_id=%s targets=%s ok=%s",
+        "trigger_all event_id=%s endpoint=%s targets=%s ok=%s",
         shared_event_id,
+        endpoint,
         len(results),
         sum(1 for result in results if result.get("ok")),
     )
 
-    return {
-        "status": "ok",
-        "event_id": shared_event_id,
-        "triggered": len(results),
-        "results": results,
-    }
+    return {"status": "ok", "event_id": shared_event_id, "triggered": len(results), "results": results}
 
 
 @app.post("/api/trigger-delayed")
 async def trigger_delayed(request: Request) -> dict[str, Any]:
     body = await request.json() if request.headers.get("content-type", "").startswith("application/json") else {}
-
     delay_seconds = int(body.get("delay_seconds", 10))
-
     logger.info("trigger_delayed delay=%s", delay_seconds)
-
     await asyncio.sleep(delay_seconds)
-
-    return await trigger_all(
-        endpoint="trigger_delayed"
-    )
+    return await trigger_all(endpoint="trigger_delayed")
 
 
 @app.get("/api/events")
@@ -498,20 +453,17 @@ def list_events(limit: int = 100, offset: int = 0, node_id: str | None = None) -
             video.event_id,
             {"event_id": video.event_id, "created_at": video.created_at, "clips": []},
         )
-        event["clips"].append(
-            {
-                "id": video.id,
-                "node_id": video.node_id,
-                "created_at": utc_iso(video.created_at),
-                "duration_seconds": video.duration_seconds,
-                "filesize_bytes": video.filesize_bytes,
-            }
-        )
+        event["clips"].append({
+            "id": video.id,
+            "node_id": video.node_id,
+            "created_at": utc_iso(video.created_at),
+            "duration_seconds": video.duration_seconds,
+            "filesize_bytes": video.filesize_bytes,
+        })
         event["created_at"] = min(event["created_at"], video.created_at)
 
     events = sorted(grouped.values(), key=lambda event: event["created_at"], reverse=True)
-    page = events[offset : offset + limit]
-
+    page = events[offset:offset + limit]
     for event in page:
         event["created_at"] = utc_iso(event["created_at"])
 
@@ -521,16 +473,13 @@ def list_events(limit: int = 100, offset: int = 0, node_id: str | None = None) -
 @app.delete("/api/events/{event_id}")
 def delete_event(event_id: str) -> dict[str, Any]:
     deleted = 0
-
     with db_session() as session:
         videos = session.query(Video).filter(Video.event_id == event_id).all()
-
         for video in videos:
             delete_file(Path(video.storage_path))
             delete_file(Path(video.thumbnail_path) if video.thumbnail_path else None)
             session.delete(video)
             deleted += 1
-
         session.commit()
 
     logger.info("delete_event event_id=%s deleted=%s", event_id, deleted)
@@ -540,13 +489,11 @@ def delete_event(event_id: str) -> dict[str, Any]:
 @app.get("/api/status")
 def server_status() -> dict[str, Any]:
     total, used, free = shutil.disk_usage(VIDEO_STORAGE)
-
     with db_session() as session:
         now = utc_now()
         nodes = session.query(Node).order_by(Node.node_id).all()
         latest_video = session.query(Video).order_by(Video.uploaded_at.desc()).first()
         video_count = session.query(Video).count()
-
         return {
             "storage": {"total_bytes": total, "used_bytes": used, "free_bytes": free},
             "nodes": [node_to_dict(node, now) for node in nodes],
@@ -555,38 +502,26 @@ def server_status() -> dict[str, Any]:
         }
 
 
-@app.post("/api/nodes/{node_id}/preview/start")
-async def api_preview_start(node_id: str) -> dict[str, Any]:
-    node = get_node_or_404(node_id)
-
-    async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
-        response = await client.post(f"http://{node['ip_address']}:8080/preview/start")
-
-    return {"status": "ok", "node_id": node_id, "node_response": response.json()}
-
-
-@app.post("/api/nodes/{node_id}/preview/stop")
-async def api_preview_stop(node_id: str) -> dict[str, Any]:
-    node = get_node_or_404(node_id)
-
-    async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
-        response = await client.post(f"http://{node['ip_address']}:8080/preview/stop")
-
-    return {"status": "ok", "node_id": node_id, "node_response": response.json()}
-
-
 @app.post("/api/nodes/{node_id}/wake")
 async def api_wake_node(node_id: str) -> dict[str, Any]:
     node = get_node_or_404(node_id)
-
     async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
         response = await client.post(f"http://{node['ip_address']}:8080/wake")
+    return {"status": "ok", "node_id": node_id, "node_response": response.json()}
 
-    return {
-        "status": "ok",
-        "node_id": node_id,
-        "node_response": response.json(),
-    }
+
+@app.delete("/api/nodes/{node_id}")
+def delete_node(node_id: str) -> dict[str, Any]:
+    with db_session() as session:
+        node = session.query(Node).filter(Node.node_id == node_id).first()
+        if not node:
+            raise HTTPException(status_code=404, detail="Node not found")
+        if is_node_online(node):
+            raise HTTPException(status_code=400, detail="Cannot delete online node")
+        session.delete(node)
+        session.commit()
+    return {"status": "ok", "deleted": node_id}
+
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
@@ -603,27 +538,6 @@ def status_page() -> str:
     return STATUS_HTML
 
 
-@app.get("/aim", response_class=HTMLResponse)
-def aim_page() -> str:
-    return AIM_HTML
-
-
-@app.delete("/api/nodes/{node_id}")
-def delete_node(node_id: str) -> dict[str, Any]:
-    with db_session() as session:
-        node = session.query(Node).filter(Node.node_id == node_id).first()
-
-        if not node:
-            raise HTTPException(status_code=404, detail="Node not found")
-
-        if is_node_online(node):
-            raise HTTPException(status_code=400, detail="Cannot delete online node")
-
-        session.delete(node)
-        session.commit()
-
-    return {"status": "ok", "deleted": node_id}
-
 # =============================================================================
 # Shared GUI styling
 # =============================================================================
@@ -639,9 +553,7 @@ COMMON_CSS = """
     --primary-text: #ffffff;
   }
 
-  * {
-    box-sizing: border-box;
-  }
+  * { box-sizing: border-box; }
 
   body {
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -659,9 +571,7 @@ COMMON_CSS = """
     border-bottom: 1px solid var(--border);
   }
 
-  h1, h2 {
-    margin: 0 0 10px 0;
-  }
+  h1, h2 { margin: 0 0 10px 0; }
 
   .top-actions {
     display: flex;
@@ -670,28 +580,19 @@ COMMON_CSS = """
     align-items: center;
   }
 
-  a {
-    color: inherit;
-    text-decoration: none;
-  }
+  a { color: inherit; text-decoration: none; }
 
-  button, select {
+  button, select, input {
     font-size: 16px;
     padding: 10px 12px;
     border-radius: 8px;
     border: 1px solid #bbbbbb;
     background: white;
-    cursor: pointer;
   }
 
-  button:hover {
-    background: #eeeeee;
-  }
-
-  button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-  }
+  button { cursor: pointer; }
+  button:hover { background: #eeeeee; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
 
   .primary {
     background: var(--primary);
@@ -699,9 +600,7 @@ COMMON_CSS = """
     border-color: var(--primary);
   }
 
-  .primary:hover {
-    background: #444444;
-  }
+  .primary:hover { background: #444444; }
 
   .layout {
     display: grid;
@@ -710,15 +609,11 @@ COMMON_CSS = """
     padding: 16px;
   }
 
-  .status-layout, .aim-layout {
+  .status-layout {
     display: grid;
-    grid-template-columns: 360px 1fr;
+    grid-template-columns: 1fr;
     gap: 16px;
     padding: 16px;
-  }
-
-  .status-layout {
-    grid-template-columns: 1fr;
     max-width: 900px;
   }
 
@@ -777,35 +672,26 @@ COMMON_CSS = """
     padding: 8px 0;
   }
 
-  .muted {
-    color: var(--muted);
-  }
-
-  .online { color: green; font-weight: bold; }
-  .offline { color: red; font-weight: bold; }
-  
-  .ready { color: #2e7d32; }
-  .camera_aim { color: #1565c0; }
-  .sleeping { color: #ef6c00; }
-  .offline { color: #c62828; }  
+  .muted { color: var(--muted); }
+  .ready { color: #2e7d32; font-weight: bold; }
+  .sleeping { color: #ef6c00; font-weight: bold; }
+  .offline { color: #c62828; font-weight: bold; }
 
   @media (max-width: 800px) {
-    .layout, .status-layout, .aim-layout {
+    .layout, .status-layout {
       display: flex;
       flex-direction: column;
       padding: 10px;
     }
 
-    .player-panel {
-      order: -1;
-    }
+    .player-panel { order: -1; }
 
     .top-actions {
       flex-direction: column;
       align-items: stretch;
     }
 
-    button, select {
+    button, select, input {
       width: 100%;
       font-size: 18px;
       padding: 12px;
@@ -838,7 +724,6 @@ INDEX_HTML = """<!doctype html>
   <h1>Video Events</h1>
   <div class="top-actions">
     <a href="/status"><button>System Status</button></a>
-    <a href="/aim"><button>Camera Aim</button></a>
     <span id="triggerStatus"></span>
   </div>
 </header>
@@ -848,10 +733,7 @@ INDEX_HTML = """<!doctype html>
     <div class="panel">
       <h2>Cam Nodes</h2>
       <div class="panel-actions" style="flex-direction:row; align-items:center;">
-        <button class="primary" onclick="triggerDelayed()">
-          Trigg Delayed
-        </button>
-
+        <button class="primary" onclick="triggerDelayed()">Trigg Delayed</button>
         <select id="triggerDelay" style="width:90px;">
           <option value="0">0 s</option>
           <option value="5">5 s</option>
@@ -860,7 +742,6 @@ INDEX_HTML = """<!doctype html>
           <option value="20">20 s</option>
         </select>
       </div>
-
       <div id="nodes">Loading...</div>
     </div>
     <br>
@@ -875,7 +756,7 @@ INDEX_HTML = """<!doctype html>
         <option value="">Auto play: None</option>
       </select>
 
-      <button onclick="loadVideos()">Refresh</button>      
+      <button onclick="loadVideos()">Refresh</button>
       <div id="events"></div>
     </div>
   </div>
@@ -883,7 +764,6 @@ INDEX_HTML = """<!doctype html>
   <div class="panel player-panel">
     <h2 id="playerTitle">Player</h2>
     <video id="player" controls preload="metadata"></video>
-
     <div class="player-controls">
       <button onclick="slowMotion()">Slow motion</button>
       <button onclick="normalSpeed()">Normal speed</button>
@@ -902,6 +782,8 @@ let newestSeenVideoId = null;
 let autoPlayInitialized = false;
 let autoPlayLoopCount = 0;
 const AUTO_PLAY_MAX_LOOPS = 5;
+let currentLiveNodeId = null;
+let playingAutoClip = false;
 
 function fmtSize(bytes) {
   return Math.round(bytes / 1024 / 1024 * 10) / 10 + " MB";
@@ -911,29 +793,93 @@ function statusLabel(status) {
   const labels = {
     ready: "Ready",
     sleeping: "Sleeping",
-    camera_aim: "Camera Aim",
     offline: "Offline"
   };
-
   return labels[status] || status;
 }
 
 function fmtLocalTime(isoString) {
   const date = new Date(isoString);
-
   return date.toLocaleString(undefined, {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    second: '2-digit'
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit'
   });
+}
+
+function nodeIp(nodeId) {
+  for (const n of window.latestNodes || []) {
+    if (n.node_id === nodeId) return n.ip_address;
+  }
+  return null;
+}
+
+function selectedAutoPlayNodeId() {
+  return document.getElementById('autoPlayNode').value;
+}
+
+function autoPlayNodeFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('autoplay') || '';
+}
+
+function restoreAutoPlaySelection() {
+  document.getElementById('autoPlayNode').value = autoPlayNodeFromUrl();
+}
+
+async function startLiveViewForAutoPlay() {
+  const nodeId = selectedAutoPlayNodeId();
+
+  if (!nodeId) {
+    stopLiveView();
+    return;
+  }
+
+  if (playingAutoClip) return;
+
+  const ip = nodeIp(nodeId);
+  if (!ip) return;
+
+  currentLiveNodeId = nodeId;
+
+  const player = document.getElementById('player');
+  player.pause();
+  player.style.display = 'none';
+
+  document.getElementById('playerTitle').innerText =
+    `${nodeAliases[nodeId] || nodeId} — Live view`;
+
+  let live = document.getElementById('livePreview');
+  if (!live) {
+    live = document.createElement('img');
+    live.id = 'livePreview';
+    live.className = 'preview-image';
+    player.insertAdjacentElement('afterend', live);
+  }
+
+  live.style.display = 'block';
+
+  if (live.src !== `http://${ip}:8080/live`) {
+    live.src = `http://${ip}:8080/live`;
+  }
+}
+
+function stopLiveView() {
+  currentLiveNodeId = null;
+  playingAutoClip = false;
+
+  const live = document.getElementById('livePreview');
+  if (live) {
+    live.style.display = 'none';
+    live.removeAttribute('src');
+  }
+
+  document.getElementById('player').style.display = 'block';
 }
 
 async function loadNodes() {
   const res = await fetch('/api/nodes');
   const nodes = await res.json();
+  window.latestNodes = nodes;
 
   const container = document.getElementById('nodes');
   container.innerHTML = '';
@@ -944,12 +890,13 @@ async function loadNodes() {
   nodeAliases = {};
   for (const n of nodes) {
     nodeAliases[n.node_id] = n.alias;
+
     const div = document.createElement('div');
     div.className = 'node-row';
     div.innerHTML = `
       <b>${n.alias}</b>:
       <span class="${n.status}">${statusLabel(n.status)}</span>
-    `;    
+    `;
     container.appendChild(div);
 
     if (!knownNodes.has(n.node_id)) {
@@ -964,17 +911,15 @@ async function loadNodes() {
       autoOpt.value = n.node_id;
       autoOpt.textContent = `Auto play: ${n.alias}`;
       autoPlaySelect.appendChild(autoOpt);
-    }    
+    }
   }
+
   restoreAutoPlaySelection();
 }
 
 function maybeAutoPlay(events) {
   const autoPlayNodeId = selectedAutoPlayNodeId();
-
-  if (!autoPlayNodeId || events.length === 0) {
-    return;
-  }
+  if (!autoPlayNodeId || events.length === 0) return;
 
   let newestMatchingClip = null;
   let newestMatchingEvent = null;
@@ -987,15 +932,10 @@ function maybeAutoPlay(events) {
         break;
       }
     }
-
-    if (newestMatchingClip) {
-      break;
-    }
+    if (newestMatchingClip) break;
   }
 
-  if (!newestMatchingClip) {
-    return;
-  }
+  if (!newestMatchingClip) return;
 
   if (!autoPlayInitialized) {
     newestSeenVideoId = newestMatchingClip.id;
@@ -1003,25 +943,28 @@ function maybeAutoPlay(events) {
     return;
   }
 
-  if (newestMatchingClip.id === newestSeenVideoId) {
-    return;
-  }
+  if (newestMatchingClip.id === newestSeenVideoId) return;
 
   newestSeenVideoId = newestMatchingClip.id;
+  autoPlayLoopCount = 0;
+  playingAutoClip = true;
 
-  const localTime = fmtLocalTime(
-    newestMatchingClip.created_at || newestMatchingEvent.created_at
-  );
+  const live = document.getElementById('livePreview');
+  if (live) live.style.display = 'none';
 
   const player = document.getElementById('player');
-  autoPlayLoopCount = 0;
+  player.style.display = 'block';
 
-  playClip(
-    { stopPropagation: () => {} },
-    newestMatchingClip.id,
-    newestMatchingClip.node_id,
-    localTime,
-  );
+  const localTime = fmtLocalTime(newestMatchingClip.created_at || newestMatchingEvent.created_at);
+  playClip({ stopPropagation: () => {} }, newestMatchingClip.id, newestMatchingClip.node_id, localTime);
+}
+
+function manualPlayClip(e, videoId, nodeId, localTime) {
+  if (selectedAutoPlayNodeId()) {
+    e.stopPropagation();
+    return;
+  }
+  playClip(e, videoId, nodeId, localTime);
 }
 
 async function loadVideos(resetOffset = false) {
@@ -1045,9 +988,7 @@ async function loadVideos(resetOffset = false) {
   for (const ev of events) {
     const eventDiv = document.createElement('div');
     eventDiv.className = 'event';
-
     const localTime = fmtLocalTime(ev.created_at);
-
     let clipsHtml = '';
 
     for (const clip of ev.clips) {
@@ -1055,16 +996,15 @@ async function loadVideos(resetOffset = false) {
         <div class="clip">
           <img
             src="/api/thumbnail/${clip.id}"
-            onclick="playClip(event, '${clip.id}', '${clip.node_id}', '${localTime}')"
+            onclick="manualPlayClip(event, '${clip.id}', '${clip.node_id}', '${localTime}')"
           >
-
           <div>
             <b>${nodeAliases[clip.node_id] || clip.node_id}</b><br>
-            <small class="muted">
-              ${clip.duration_seconds}s |
-              ${fmtSize(clip.filesize_bytes)}
-            </small><br>
-            <button onclick="playClip(event, '${clip.id}', '${clip.node_id}', '${localTime}')">
+            <small class="muted">${clip.duration_seconds}s | ${fmtSize(clip.filesize_bytes)}</small><br>
+            <button
+              onclick="manualPlayClip(event, '${clip.id}', '${clip.node_id}', '${localTime}')"
+              ${selectedAutoPlayNodeId() ? "disabled" : ""}
+            >
               Play
             </button>
           </div>
@@ -1076,16 +1016,10 @@ async function loadVideos(resetOffset = false) {
       <div>
         <b>${localTime}</b><br>
         <small class="muted">${ev.clips.length} clip(s) from this trigger</small><br>
-        <button onclick="deleteEvent(event, '${ev.event_id}')">
-          Delete trigger
-        </button>
+        <button onclick="deleteEvent(event, '${ev.event_id}')">Delete trigger</button>
       </div>
-
-      <div style="margin-top:8px;">
-        ${clipsHtml}
-      </div>
+      <div style="margin-top:8px;">${clipsHtml}</div>
     `;
-
     container.appendChild(eventDiv);
   }
 
@@ -1111,16 +1045,12 @@ async function loadVideos(resetOffset = false) {
   nav.appendChild(prev);
   nav.appendChild(next);
   container.appendChild(nav);
-  maybeAutoPlay(events);
-}
 
-function selectedAutoPlayNodeId() {
-  return document.getElementById('autoPlayNode').value;
+  maybeAutoPlay(events);
 }
 
 function saveAutoPlaySelection() {
   const nodeId = selectedAutoPlayNodeId();
-
   const url = new URL(window.location);
 
   if (nodeId) {
@@ -1130,64 +1060,53 @@ function saveAutoPlaySelection() {
   }
 
   history.replaceState({}, '', url);
-}
 
-function autoPlayNodeFromUrl() {
-  const params = new URLSearchParams(window.location.search);
-  return params.get('autoplay') || '';
-}
+  newestSeenVideoId = null;
+  autoPlayInitialized = false;
+  autoPlayLoopCount = 0;
+  playingAutoClip = false;
 
-function restoreAutoPlaySelection() {
-  document.getElementById('autoPlayNode').value =
-    autoPlayNodeFromUrl();
+  startLiveViewForAutoPlay();
+  loadVideos(false);
 }
 
 function playClip(e, videoId, nodeId, localTime) {
   e.stopPropagation();
 
+  const live = document.getElementById('livePreview');
+  if (live) live.style.display = 'none';
+
   const player = document.getElementById('player');
+  player.style.display = 'block';
   player.loop = false;
   player.src = `/api/video/${videoId}`;
 
-  document.getElementById('playerTitle').innerText =
-    `${nodeAliases[nodeId] || nodeId} — ${localTime}`;
-
+  document.getElementById('playerTitle').innerText = `${nodeAliases[nodeId] || nodeId} — ${localTime}`;
   player.play();
 }
 
 async function triggerDelayed() {
   const status = document.getElementById('triggerStatus');
   const delay = parseInt(document.getElementById('triggerDelay').value);
-
   status.innerText = `Triggering in ${delay}s...`;
 
   try {
     const res = await fetch('/api/trigger-delayed', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        delay_seconds: delay
-      })
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ delay_seconds: delay })
     });
 
     const data = await res.json();
-
     const ok = data.results.filter(r => r.ok).length;
     const total = data.results.length;
-
     status.innerText = `Triggered ${ok}/${total} nodes`;
 
     await loadVideos(true);
     setTimeout(() => loadVideos(true), 3000);
     setTimeout(() => loadVideos(true), 6000);
     setTimeout(() => loadVideos(true), 9000);
-
-    setTimeout(() => {
-      status.innerText = '';
-    }, 5000);
-
+    setTimeout(() => { status.innerText = ''; }, 5000);
   } catch (e) {
     status.innerText = 'Trigger failed';
   }
@@ -1195,32 +1114,22 @@ async function triggerDelayed() {
 
 async function deleteEvent(e, eventId) {
   e.stopPropagation();
+  if (!confirm('Delete all clips from this trigger?')) return;
 
-  if (!confirm('Delete all clips from this trigger?')) {
-    return;
-  }
-
-  const res = await fetch(`/api/events/${eventId}`, {
-    method: 'DELETE'
-  });
-
+  const res = await fetch(`/api/events/${eventId}`, { method: 'DELETE' });
   const data = await res.json();
-
   alert(`Deleted ${data.deleted} clip(s)`);
-
   await loadVideos(true);
 }
 
 const FPS = 30;
 
 function slowMotion() {
-  const player = document.getElementById('player');
-  player.playbackRate = 0.25;
+  document.getElementById('player').playbackRate = 0.25;
 }
 
 function normalSpeed() {
-  const player = document.getElementById('player');
-  player.playbackRate = 1.0;
+  document.getElementById('player').playbackRate = 1.0;
 }
 
 function stepForward() {
@@ -1238,19 +1147,24 @@ function stepBack() {
 async function refreshAll() {
   await loadNodes();
   await loadVideos(false);
+
+  if (selectedAutoPlayNodeId() && !playingAutoClip) {
+    await startLiveViewForAutoPlay();
+  }
 }
 
 refreshAll();
-document.getElementById('player').addEventListener('ended', () => {
+
+document.getElementById('player').addEventListener('ended', async () => {
   const autoPlayNodeId = selectedAutoPlayNodeId();
 
-  if (!autoPlayNodeId) {
-    return;
-  }
+  if (!autoPlayNodeId || !playingAutoClip) return;
 
   autoPlayLoopCount++;
 
   if (autoPlayLoopCount >= AUTO_PLAY_MAX_LOOPS) {
+    playingAutoClip = false;
+    await startLiveViewForAutoPlay();
     return;
   }
 
@@ -1258,6 +1172,7 @@ document.getElementById('player').addEventListener('ended', () => {
   player.currentTime = 0;
   player.play();
 });
+
 setInterval(refreshAll, 10000);
 </script>
 </body>
@@ -1278,7 +1193,6 @@ STATUS_HTML = """<!doctype html>
   <h1>System Status</h1>
   <div class="top-actions">
     <a href="/"><button>Video Events</button></a>
-    <a href="/aim"><button>Camera Aim</button></a>
   </div>
 </header>
 
@@ -1292,7 +1206,6 @@ STATUS_HTML = """<!doctype html>
     <h2>Videos</h2>
     <div id="videos">Loading...</div>
   </div>
-
 </div>
 
 <script>
@@ -1311,10 +1224,8 @@ function statusLabel(status) {
   const labels = {
     ready: "Ready",
     sleeping: "Sleeping",
-    camera_aim: "Camera Aim",
     offline: "Offline"
   };
-
   return labels[status] || status;
 }
 
@@ -1322,35 +1233,24 @@ async function loadStatus() {
   const res = await fetch('/api/status');
   const s = await res.json();
 
-  const usedPercent = Math.round(s.storage.used_bytes / s.storage.total_bytes * 1000) / 10;
-
   document.getElementById('nodes').innerHTML = s.nodes.map(n => `
     <div>
       <b>${n.alias}</b>
       <span class="${n.status}">${statusLabel(n.status)}</span>
-      <small class="muted" style="margin-left:12px;">
-        Last seen: ${fmtLocalTime(n.last_seen)}
-      </small><br>
+      <small class="muted" style="margin-left:12px;">Last seen: ${fmtLocalTime(n.last_seen)}</small><br>
 
-      <small class="muted">
-        Real ID: ${n.node_id}
-      </small>
+      <small class="muted">Real ID: ${n.node_id}</small>
+      <small class="muted" style="margin-left:12px;">IP: ${n.ip_address || "-"}</small><br>
 
-      <small class="muted" style="margin-left:12px;">
-        IP: ${n.ip_address || "-"}
-      </small><br>    
-  
       <input
         id="alias-${n.node_id}"
         value="${n.alias}"
         onfocus="editingAlias = true"
         onblur="editingAlias = false"
         style="font-size:16px; padding:8px; margin-top:6px;"
-      >      
+      >
 
-      <button onclick="saveAlias('${n.node_id}')">
-        Save name
-      </button>
+      <button onclick="saveAlias('${n.node_id}')">Save name</button>
 
       <button
         onclick="deleteNode('${n.node_id}')"
@@ -1364,11 +1264,10 @@ async function loadStatus() {
         ${n.status !== "sleeping" ? "disabled" : ""}
       >
         Wake
-      </button>      
-
+      </button>
     </div><br>
-  `).join('');  
-  
+  `).join('');
+
   document.getElementById('videos').innerHTML = `
     Stored clips: <b>${s.video_count}</b><br>
     Used: <b>${fmtSize(s.storage.used_bytes)}</b>
@@ -1390,9 +1289,7 @@ async function saveAlias(nodeId) {
 
   const res = await fetch(`/api/nodes/${nodeId}/alias`, {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ alias }),
   });
 
@@ -1405,14 +1302,9 @@ async function saveAlias(nodeId) {
 }
 
 async function deleteNode(nodeId) {
-  if (!confirm("Delete this offline node?")) {
-    return;
-  }
+  if (!confirm("Delete this offline node?")) return;
 
-  const res = await fetch(`/api/nodes/${nodeId}`, {
-    method: "DELETE"
-  });
-
+  const res = await fetch(`/api/nodes/${nodeId}`, { method: "DELETE" });
   if (!res.ok) {
     alert("Failed to delete node");
     return;
@@ -1422,10 +1314,7 @@ async function deleteNode(nodeId) {
 }
 
 async function wakeNode(nodeId) {
-  const res = await fetch(`/api/nodes/${nodeId}/wake`, {
-    method: "POST"
-  });
-
+  const res = await fetch(`/api/nodes/${nodeId}/wake`, { method: "POST" });
   if (!res.ok) {
     alert("Failed to wake node");
     return;
@@ -1436,108 +1325,8 @@ async function wakeNode(nodeId) {
 
 loadStatus();
 setInterval(() => {
-  if (!editingAlias) {
-    loadStatus();
-  }
+  if (!editingAlias) loadStatus();
 }, 10000);
-</script>
-</body>
-</html>
-""".replace("{{COMMON_CSS}}", COMMON_CSS)
-
-# =============================================================================
-# Camera Aim page
-# =============================================================================
-AIM_HTML = """<!doctype html>
-<html>
-<head>
-  <title>Camera Aim</title>
-  {{COMMON_CSS}}
-</head>
-<body>
-<header>
-  <h1>Camera Aim</h1>
-  <div class="top-actions">
-    <a href="/"><button>Video Events</button></a>
-    <a href="/status"><button>System Status</button></a>
-  </div>
-</header>
-
-<div class="aim-layout">
-  <div class="panel">
-    <h2>Cam Nodes</h2>
-    <div id="nodes">Loading...</div>
-  </div>
-
-  <div class="panel">
-    <h2 id="title">Preview</h2>
-    <div id="preview">Select a camera and start preview.</div>
-  </div>
-</div>
-
-<script>
-async function loadNodes() {
-  const res = await fetch('/api/nodes');
-  const nodes = await res.json();
-
-  const container = document.getElementById('nodes');
-  container.innerHTML = '';
-  
-  for (const n of nodes) {
-    const div = document.createElement('div');
-    div.className = 'node-row';
-
-    div.innerHTML = `
-      <b>${n.alias}</b>
-      <span class="${n.status}" style="margin-left:12px;">
-        ${statusLabel(n.status)}
-      </span><br>
-
-      <button onclick="startPreview('${n.node_id}', '${n.ip_address}')">
-        Start preview
-      </button>
-
-      <button onclick="stopPreview('${n.node_id}')">
-        Stop preview
-      </button>
-    `;    
-
-    container.appendChild(div);
-  }
-}
-
-function statusLabel(status) {
-  const labels = {
-    ready: "Ready",
-    sleeping: "Sleeping",
-    camera_aim: "Camera Aim",
-    offline: "Offline"
-  };
-
-  return labels[status] || status;
-}
-
-async function startPreview(nodeId, ip) {
-  document.getElementById('title').innerText = `Preview — ${nodeId}`;
-
-  await fetch(`/api/nodes/${nodeId}/preview/start`, { method: 'POST' });
-
-  document.getElementById('preview').innerHTML = `
-    <img class="preview-image" src="http://${ip}:8080/preview?ts=${Date.now()}">
-  `;
-}
-
-async function stopPreview(nodeId) {
-  await fetch(`/api/nodes/${nodeId}/preview/stop`, { method: 'POST' });
-
-  document.getElementById('preview').innerHTML =
-    'Preview stopped. Recording mode restarted.';
-
-  document.getElementById('title').innerText = 'Preview';
-}
-
-loadNodes();
-setInterval(loadNodes, 10000);
 </script>
 </body>
 </html>

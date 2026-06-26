@@ -1,9 +1,17 @@
-"""FastAPI video node for buffering, clipping, previewing, and uploading camera footage."""
+"""FastAPI video node for buffering, clipping, live view, and uploading camera footage.
+
+This version uses one camera owner only: the recorder process. The recorder writes
+both the rolling MPEG-TS segment buffer used for trigger clips and a continuously
+updated JPEG frame used by /live for browser live view. Live view no longer stops
+recording.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import signal
 import shutil
 import socket
 import subprocess
@@ -19,8 +27,6 @@ import uvicorn
 import yaml
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
-import os
-import signal
 
 CONFIG_PATH = Path("config.yaml")
 MAC_ADDRESS_PATH = Path("/sys/class/net/wlan0/address")
@@ -28,15 +34,17 @@ HEARTBEAT_INTERVAL_SECONDS = 10
 FFMPEG_HEALTH_CHECK_INTERVAL_SECONDS = 3
 RECORDER_MAX_SEGMENT_AGE_SECONDS = 8
 UPLOAD_RETRY_INTERVAL_SECONDS = 3
-PREVIEW_FRAME_RATE = 10
-PREVIEW_SCALE = "640:-1"
+LIVE_FPS = 10
+LIVE_SCALE = "640:-1"
+LIVE_POLL_SECONDS = 0.10
 
 last_trigger_at = time.monotonic()
 ffmpeg_started_at = 0.0
-current_mode = "recording"  # recording, preview, sleeping
+current_mode = "recording"  # recording, sleeping
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
 
 class TriggerEvent(TypedDict):
     event_id: str
@@ -56,11 +64,13 @@ cfg = load_config()
 BASE_DIR = Path(cfg["buffer"]["base_dir"])
 SEGMENT_DIR = BASE_DIR / "segments"
 CLIP_DIR = BASE_DIR / "clips"
+LIVE_JPEG_PATH = BASE_DIR / "live.jpg"
 
 PRE_SECONDS = int(cfg["trigger"]["pre_seconds"])
 POST_SECONDS = int(cfg["trigger"]["post_seconds"])
 PRE_SECONDS_DELAYED = int(cfg["trigger"].get("pre_seconds_delayed", PRE_SECONDS))
 POST_SECONDS_DELAYED = int(cfg["trigger"].get("post_seconds_delayed", POST_SECONDS))
+TRIGGER_SEGMENT_OFFSET = int(cfg["trigger"].get("trigger_segment_offset", 0))
 
 SEGMENT_SECONDS = int(cfg["buffer"]["segment_seconds"])
 BUFFER_EXTRA_SECONDS = int(cfg["buffer"].get("extra_seconds", 10))
@@ -78,8 +88,6 @@ TOKEN = str(cfg["server"]["token"])
 SEGMENT_PATTERN = SEGMENT_DIR / "segment_%03d.ts"
 
 ffmpeg_process: subprocess.Popen[bytes] | None = None
-preview_process: subprocess.Popen[bytes] | None = None
-preview_lock = asyncio.Lock()
 trigger_queue: asyncio.Queue[TriggerEvent] = asyncio.Queue()
 
 
@@ -117,7 +125,6 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         with suppress(asyncio.CancelledError):
             await asyncio.gather(*tasks)
 
-        stop_preview_process()
         stop_ffmpeg()
 
 
@@ -125,21 +132,15 @@ app = FastAPI(lifespan=lifespan)
 
 
 def wake_recording() -> None:
-    global current_mode
-    global ffmpeg_started_at
-    global last_trigger_at
+    global current_mode, ffmpeg_started_at, last_trigger_at
 
     if current_mode == "recording":
         return
 
-    stop_preview_process()
-
     current_mode = "recording"
     start_ffmpeg()
-
     ffmpeg_started_at = time.monotonic()
     last_trigger_at = time.monotonic()
-
     logger.info("Node woke up; recording started")
 
 
@@ -157,6 +158,7 @@ def sleep_recording() -> None:
 def ensure_directories() -> None:
     SEGMENT_DIR.mkdir(parents=True, exist_ok=True)
     CLIP_DIR.mkdir(parents=True, exist_ok=True)
+    LIVE_JPEG_PATH.unlink(missing_ok=True)
 
     for segment in SEGMENT_DIR.glob("segment_*.ts"):
         segment.unlink(missing_ok=True)
@@ -174,30 +176,12 @@ def get_local_ip() -> str:
             return "127.0.0.1"
 
 
-def segment_sort_key(path: Path) -> tuple[float, str]:
-    return (path.stat().st_mtime, path.name)
-
-
 def get_segments_by_mtime() -> list[Path]:
     segments = [
         path for path in SEGMENT_DIR.glob("segment_*.ts")
         if path.stat().st_size > 0
     ]
-    return sorted(segments, key=segment_sort_key)
-
-
-def newest_safe_segment() -> Path | None:
-    segments = get_segments_by_mtime()
-
-    if len(segments) < 2:
-        return None
-
-    # Ignore newest because it may still be written.
-    return segments[-2]
-
-def get_segments_by_mtime() -> list[Path]:
-    segments = [path for path in SEGMENT_DIR.glob("segment_*.ts") if path.stat().st_size > 0]
-    return sorted(segments, key=lambda path: path.stat().st_mtime)
+    return sorted(segments, key=lambda path: (path.stat().st_mtime, path.name))
 
 
 def get_safe_segments() -> list[Path]:
@@ -205,8 +189,31 @@ def get_safe_segments() -> list[Path]:
     return get_segments_by_mtime()[:-1]
 
 
+def newest_safe_segment() -> Path | None:
+    safe_segments = get_safe_segments()
+    if not safe_segments:
+        return None
+    return safe_segments[-1]
+
+
 def required_segment_count(seconds: int) -> int:
     return seconds // SEGMENT_SECONDS + 2
+
+
+def buffer_ready(pre_seconds: int = PRE_SECONDS) -> bool:
+    return len(get_safe_segments()) >= required_segment_count(pre_seconds)
+
+
+def offset_segment(segment: Path, offset: int) -> Path:
+    segments = get_segments_by_mtime()
+    names = [path.name for path in segments]
+
+    if segment.name not in names:
+        return segment
+
+    pos = names.index(segment.name)
+    new_pos = min(len(segments) - 1, max(0, pos + offset))
+    return segments[new_pos]
 
 
 def select_segments_around_trigger_segment(
@@ -218,32 +225,22 @@ def select_segments_around_trigger_segment(
     names = [segment.name for segment in segments]
 
     if trigger_segment_name not in names:
-        # The exact trigger segment may have wrapped away.
-        # Fall back to newest available safe segment.
         trigger_pos = max(0, len(segments) - post_count - 1)
     else:
         trigger_pos = names.index(trigger_segment_name)
 
     start = max(0, trigger_pos - pre_count)
     end = min(len(segments), trigger_pos + post_count + 1)
-
     selected = segments[start:end]
 
     logger.info(
         "clip_select trigger=%s trigger_pos=%s selected=%s",
         trigger_segment_name,
         trigger_pos,
-        [p.name for p in selected],
+        [path.name for path in selected],
     )
 
     return selected
-
-def buffer_ready() -> bool:
-    return len(get_safe_segments()) >= required_segment_count(PRE_SECONDS)
-
-
-def select_recent_segments(seconds: int) -> list[Path]:
-    return get_safe_segments()[-required_segment_count(seconds) :]
 
 
 def recorder_is_healthy() -> bool:
@@ -273,61 +270,53 @@ def build_recording_command() -> list[str]:
                 f"-o - "
                 f"| ffmpeg -hide_banner -loglevel warning "
                 f"-f h264 -i pipe:0 "
-                f"-c copy "
+                f"-map 0:v -c:v copy "
                 f"-f segment "
                 f"-segment_time {SEGMENT_SECONDS} "
                 f"-segment_wrap {SEGMENT_COUNT} "
                 f"-segment_format mpegts "
                 f"-reset_timestamps 1 "
-                f"{SEGMENT_PATTERN}"
+                f"{SEGMENT_PATTERN} "
+                f"-map 0:v -vf fps={LIVE_FPS},scale={LIVE_SCALE} "
+                f"-q:v 5 -update 1 -f image2 {LIVE_JPEG_PATH}"
             ),
         ]
 
     if camera_cfg.get("type") == "usb":
         fps = str(camera_cfg["fps"])
-
         return [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-f",
-            "v4l2",
-            "-input_format",
-            str(camera_cfg.get("input_format", "mjpeg")),
-            "-video_size",
-            f'{camera_cfg["width"]}x{camera_cfg["height"]}',
-            "-framerate",
-            fps,
-            "-i",
-            str(camera_cfg["device"]),
+            "-loglevel", "warning",
+            "-f", "v4l2",
+            "-input_format", str(camera_cfg.get("input_format", "mjpeg")),
+            "-video_size", f'{camera_cfg["width"]}x{camera_cfg["height"]}',
+            "-framerate", fps,
+            "-i", str(camera_cfg["device"]),
             "-an",
-            "-vf",
-            "format=yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "28",
-            "-g",
-            fps,
-            "-keyint_min",
-            fps,
-            "-sc_threshold",
-            "0",
-            "-f",
-            "segment",
-            "-segment_time",
-            str(SEGMENT_SECONDS),
-            "-segment_wrap",
-            str(SEGMENT_COUNT),
-            "-segment_format",
-            "mpegts",
-            "-reset_timestamps",
-            "1",
+            "-filter_complex",
+            f"[0:v]split=2[rec][live];[rec]format=yuv420p[recout];[live]fps={LIVE_FPS},scale={LIVE_SCALE}[liveout]",
+            "-map", "[recout]",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
+            "-g", fps,
+            "-keyint_min", fps,
+            "-sc_threshold", "0",
+            "-f", "segment",
+            "-segment_time", str(SEGMENT_SECONDS),
+            "-segment_wrap", str(SEGMENT_COUNT),
+            "-segment_format", "mpegts",
+            "-reset_timestamps", "1",
             str(SEGMENT_PATTERN),
+            "-map", "[liveout]",
+            "-q:v", "5",
+            "-update", "1",
+            "-f", "image2",
+            str(LIVE_JPEG_PATH),
         ]
+
+    raise RuntimeError(f"Unsupported camera type: {camera_cfg.get('type')}")
 
 
 def start_ffmpeg() -> None:
@@ -378,10 +367,8 @@ async def monitor_ffmpeg() -> None:
         if ffmpeg_dead:
             logger.warning("FFmpeg is not running; restarting")
             start_ffmpeg()
-
         elif time.monotonic() - ffmpeg_started_at < 10:
             pass
-
         elif not recorder_is_healthy():
             logger.warning("Recorder is unhealthy; restarting FFmpeg")
             stop_ffmpeg()
@@ -393,7 +380,6 @@ async def monitor_ffmpeg() -> None:
 def heartbeat_status() -> str:
     return {
         "recording": "ready",
-        "preview": "camera_aim",
         "sleeping": "sleeping",
     }.get(current_mode, "unknown")
 
@@ -417,6 +403,17 @@ async def heartbeat_worker() -> None:
                 logger.exception("Heartbeat failed")
 
             await asyncio.sleep(HEARTBEAT_INTERVAL_SECONDS)
+
+
+async def power_worker() -> None:
+    while True:
+        if current_mode == "recording":
+            idle_seconds = time.monotonic() - last_trigger_at
+            if idle_seconds >= POWER_IDLE_TIMEOUT_SECONDS:
+                sleep_recording()
+
+        await asyncio.sleep(5)
+
 
 async def build_clip(
     event_id: str,
@@ -450,17 +447,6 @@ async def build_clip(
         return output_file
     finally:
         shutil.rmtree(event_dir, ignore_errors=True)
-
-
-async def power_worker() -> None:
-    while True:
-        if current_mode == "recording":
-            idle_seconds = time.monotonic() - last_trigger_at
-
-            if idle_seconds >= POWER_IDLE_TIMEOUT_SECONDS:
-                sleep_recording()
-
-        await asyncio.sleep(5)
 
 
 def copy_segments_for_clip(segments: list[Path], event_dir: Path) -> list[Path]:
@@ -522,13 +508,7 @@ async def upload_clip(
     async with aiohttp.ClientSession(headers=headers) as session:
         while time.monotonic() < timeout_at:
             try:
-                if await try_upload_clip(
-                    session,
-                    event_id,
-                    clip_path,
-                    created_at,
-                    duration_seconds,
-                ):
+                if await try_upload_clip(session, event_id, clip_path, created_at, duration_seconds):
                     logger.info("Uploaded clip %s", event_id)
                     return True
             except Exception:
@@ -605,102 +585,45 @@ async def trigger_worker() -> None:
             trigger_queue.task_done()
 
 
-def build_preview_command() -> list[str]:
-    camera_cfg = cfg["camera"]
+def latest_jpeg_bytes() -> bytes | None:
+    if not LIVE_JPEG_PATH.exists():
+        return None
 
-    if camera_cfg.get("type") == "picam":
-        return [
-            "bash",
-            "-lc",
-            (
-                f"rpicam-vid --nopreview -t 0 "
-                f"--width 640 "
-                f"--height 360 "
-                f"--framerate {PREVIEW_FRAME_RATE} "
-                f"--codec mjpeg "
-                f"--flush "
-                f"-o -"
-            ),
-        ]
+    try:
+        data = LIVE_JPEG_PATH.read_bytes()
+    except OSError:
+        return None
 
-    if camera_cfg.get("type") == "usb":
-        return [
-            "ffmpeg",
-            "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-f",
-            "v4l2",
-            "-input_format",
-            str(camera_cfg.get("input_format", "mjpeg")),
-            "-video_size",
-            f'{camera_cfg["width"]}x{camera_cfg["height"]}',
-            "-framerate",
-            str(PREVIEW_FRAME_RATE),
-            "-i",
-            str(camera_cfg["device"]),
-            "-vf",
-            f"scale={PREVIEW_SCALE}",
-            "-q:v",
-            "5",
-            "-f",
-            "mjpeg",
-            "pipe:1",
-        ]
+    start = data.find(b"\xff\xd8")
+    end = data.rfind(b"\xff\xd9")
+
+    if start == -1 or end == -1 or end <= start:
+        return None
+
+    return data[start:end + 2]
 
 
-def start_preview_process() -> None:
-    global preview_process
+def live_mjpeg_generator() -> Iterator[bytes]:
+    last_frame: bytes | None = None
 
-    if preview_process is not None and preview_process.poll() is None:
-        return
-    preview_process = subprocess.Popen(
-        build_preview_command(),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        bufsize=0,
-        start_new_session=True,
-    )
+    while True:
+        if current_mode != "recording":
+            time.sleep(LIVE_POLL_SECONDS)
+            continue
 
+        frame = latest_jpeg_bytes()
+        if frame is None or frame == last_frame:
+            time.sleep(LIVE_POLL_SECONDS)
+            continue
 
-def stop_preview_process() -> None:
-    global preview_process
-
-    if preview_process is None:
-        return
-
-    terminate_process(preview_process)
-    preview_process = None
-    logger.info("Preview process stopped")
-
-
-def mjpeg_generator() -> Iterator[bytes]:
-    if preview_process is None or preview_process.stdout is None:
-        return
-
-    buffer = b""
-    while (
-        preview_process is not None
-        and preview_process.poll() is None
-    ):
-        if preview_process is None or preview_process.stdout is None:
-            break
-
-        chunk = preview_process.stdout.read(4096)
-        if not chunk:
-            break
-
-        buffer += chunk
-        while True:
-            start = buffer.find(b"\xff\xd8")
-            end = buffer.find(b"\xff\xd9")
-
-            if start == -1 or end == -1 or end <= start:
-                break
-
-            frame = buffer[start : end + 2]
-            buffer = buffer[end + 2 :]
-            yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + frame + b"\r\n"
+        last_frame = frame
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Cache-Control: no-cache\r\n\r\n"
+            + frame
+            + b"\r\n"
+        )
 
 
 async def parse_trigger_body(request: Request) -> dict[str, Any]:
@@ -712,28 +635,14 @@ async def parse_trigger_body(request: Request) -> dict[str, Any]:
     return body if isinstance(body, dict) else {}
 
 
-def offset_segment(segment: Path, offset: int) -> Path:
-    segments = get_segments_by_mtime()
-    names = [p.name for p in segments]
-
-    if segment.name not in names:
-        return segment
-
-    pos = names.index(segment.name)
-    new_pos = min(len(segments) - 1, max(0, pos + offset))
-    return segments[new_pos]
-
-
 async def queue_trigger(
     request: Request,
     pre_seconds: int,
     post_seconds: int,
 ) -> dict[str, Any]:
-
     global last_trigger_at
 
     body = await parse_trigger_body(request)
-
     event_id = str(body.get("event_id") or uuid.uuid4())
     created_at = str(body.get("created_at") or datetime.now(timezone.utc).isoformat())
 
@@ -750,13 +659,18 @@ async def queue_trigger(
 
         raise HTTPException(status_code=503, detail="Node sleeping")
 
-    if not buffer_ready():
+    if current_mode != "recording":
+        raise HTTPException(status_code=503, detail=f"Node not recording: {current_mode}")
+
+    if not buffer_ready(pre_seconds):
         raise HTTPException(status_code=503, detail="Video buffer not ready")
 
     trigger_segment = newest_safe_segment()
-
     if trigger_segment is None:
         raise HTTPException(status_code=503, detail="Video buffer not ready")
+
+    if TRIGGER_SEGMENT_OFFSET:
+        trigger_segment = offset_segment(trigger_segment, TRIGGER_SEGMENT_OFFSET)
 
     await trigger_queue.put({
         "event_id": event_id,
@@ -790,55 +704,28 @@ async def trigger_delayed_node(request: Request) -> dict[str, Any]:
         post_seconds=POST_SECONDS_DELAYED,
     )
 
-@app.get("/health")
-async def health() -> dict[str, Any]:
-    ffmpeg_ok = ffmpeg_process is not None and ffmpeg_process.poll() is None
-    recorder_ok = recorder_is_healthy()
 
-    return {
-        "status": "ok" if ffmpeg_ok and recorder_ok else "degraded",
-        "node_id": NODE_ID,
-        "ffmpeg_running": ffmpeg_ok,
-        "recorder_healthy": recorder_ok,
-        "queue_size": trigger_queue.qsize(),
-    }
-
-
-@app.post("/preview/start")
-async def preview_start() -> dict[str, str]:
-    global current_mode
-
-    async with preview_lock:
-        current_mode = "preview"
-        stop_ffmpeg()
-        await asyncio.sleep(1.0)
-        start_preview_process()
-
-    return {"status": "preview_started"}
-
-
-@app.get("/preview")
-async def preview_stream() -> StreamingResponse:
-    if preview_process is None or preview_process.poll() is not None:
-        start_preview_process()
-
+@app.get("/live")
+async def live_stream() -> StreamingResponse:
     return StreamingResponse(
-        mjpeg_generator(),
+        live_mjpeg_generator(),
         media_type="multipart/x-mixed-replace; boundary=frame",
     )
 
 
-@app.post("/preview/stop")
-async def preview_stop() -> dict[str, str]:
-    global current_mode
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    ffmpeg_ok = ffmpeg_process is not None and ffmpeg_process.poll() is None
+    recorder_ok = recorder_is_healthy() if current_mode == "recording" else False
 
-    async with preview_lock:
-        stop_preview_process()
-        await asyncio.sleep(1.0)
-        current_mode = "recording"
-        start_ffmpeg()
-
-    return {"status": "recording_started"}
+    return {
+        "status": "ok" if ffmpeg_ok and recorder_ok else "degraded",
+        "node_id": NODE_ID,
+        "mode": current_mode,
+        "ffmpeg_running": ffmpeg_ok,
+        "recorder_healthy": recorder_ok,
+        "queue_size": trigger_queue.qsize(),
+    }
 
 
 @app.post("/wake")
