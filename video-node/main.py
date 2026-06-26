@@ -268,7 +268,7 @@ def build_recording_command() -> list[str]:
                 f"--intra {camera_cfg['fps']} "
                 f"--inline "
                 f"-o - "
-                f"| ffmpeg -hide_banner -loglevel warning "
+                f"| ffmpeg -y -hide_banner -loglevel warning "
                 f"-f h264 -i pipe:0 "
                 f"-map 0:v -c:v copy "
                 f"-f segment "
@@ -286,6 +286,7 @@ def build_recording_command() -> list[str]:
         fps = str(camera_cfg["fps"])
         return [
             "ffmpeg",
+            "-y",
             "-hide_banner",
             "-loglevel", "warning",
             "-f", "v4l2",
@@ -324,6 +325,8 @@ def start_ffmpeg() -> None:
 
     if ffmpeg_process is not None and ffmpeg_process.poll() is None:
         return
+    
+    LIVE_JPEG_PATH.unlink(missing_ok=True)
 
     ffmpeg_process = subprocess.Popen(
         build_recording_command(),
