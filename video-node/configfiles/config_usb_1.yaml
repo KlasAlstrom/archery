@@ -8,7 +8,7 @@ camera:
   input_format: mjpeg
 
 buffer:
-  base_dir: /dev/shm/video-node
+  base_dir: /dev/shm/video-node1
   segment_seconds: 1
   extra_seconds: 10
 

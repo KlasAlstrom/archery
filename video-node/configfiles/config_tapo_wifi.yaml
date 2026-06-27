@@ -1,10 +1,10 @@
 camera:
+  type: rtsp
   index: 1
-  type: usb
-  device: /dev/video0
+  rtsp_url: rtsp://user:passwd@192.168.60.165:554/stream1
+  fps: 25
   width: 1280
   height: 720
-  fps: 30
   input_format: mjpeg
 
 buffer:

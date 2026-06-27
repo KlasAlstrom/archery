@@ -1,14 +1,14 @@
 camera:
-  index: 1
+  index: 2
   type: usb
-  device: /dev/video0
+  device: /dev/video1
   width: 1280
   height: 720
   fps: 30
   input_format: mjpeg
 
 buffer:
-  base_dir: /dev/shm/video-node
+  base_dir: /dev/shm/video-node2
   segment_seconds: 1
   extra_seconds: 10
 

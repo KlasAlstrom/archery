@@ -97,7 +97,9 @@ def generate_node_id() -> str:
     except OSError:
         mac_address = "00:00:00:00:00:00"
 
-    return f"Cam-{mac_address.replace(':', '')}"
+    camera_index = str(cfg["camera"].get("index", 1))
+
+    return f"Cam-{mac_address.replace(':', '')}-{camera_index}"
 
 
 NODE_ID = generate_node_id()
@@ -314,6 +316,58 @@ def build_recording_command() -> list[str]:
             "-q:v", "5",
             "-update", "1",
             "-f", "image2",
+            str(LIVE_JPEG_PATH),
+        ]
+    
+    if camera_cfg.get("type") == "rtsp":
+        fps = str(camera_cfg.get("fps", 25))
+
+        return [
+            "ffmpeg",
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "warning",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            str(camera_cfg["rtsp_url"]),
+            "-an",
+            "-filter_complex",
+            "[0:v]split=2[rec][live];"
+            "[rec]format=yuv420p[recout];"
+            "[live]scale=640:-1,fps=10[liveout]",
+            "-map",
+            "[recout]",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-crf",
+            "28",
+            "-g",
+            fps,
+            "-keyint_min",
+            fps,
+            "-sc_threshold",
+            "0",
+            "-f",
+            "segment",
+            "-segment_time",
+            str(SEGMENT_SECONDS),
+            "-segment_wrap",
+            str(SEGMENT_COUNT),
+            "-segment_format",
+            "mpegts",
+            "-reset_timestamps",
+            "1",
+            str(SEGMENT_PATTERN),
+            "-map",
+            "[liveout]",
+            "-q:v",
+            "5",
+            "-update",
+            "1",
             str(LIVE_JPEG_PATH),
         ]
 
