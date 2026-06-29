@@ -345,12 +345,10 @@ def build_recording_command() -> list[str]:
             "ultrafast",
             "-crf",
             "28",
-            "-g",
-            fps,
-            "-keyint_min",
-            fps,
-            "-sc_threshold",
-            "0",
+            "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})",
+            "-g", fps,
+            "-keyint_min", fps,
+            "-sc_threshold", "0",            
             "-f",
             "segment",
             "-segment_time",
@@ -615,7 +613,7 @@ async def trigger_worker() -> None:
 
             pre_seconds = event["pre_seconds"]
             post_seconds = event["post_seconds"]
-            duration_seconds = pre_seconds + post_seconds
+            duration_seconds = pre_seconds + post_seconds + SEGMENT_SECONDS
 
             clip = await build_clip(
                 event_id,
