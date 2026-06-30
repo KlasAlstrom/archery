@@ -707,6 +707,38 @@ COMMON_CSS = """
       height: 62px;
     }
   }
+
+  body.kiosk-mode header,
+  body.kiosk-mode .layout > div:first-child,
+  body.kiosk-mode .player-controls {
+    display: none;
+  }
+
+  body.kiosk-mode .layout {
+    display: block;
+    padding: 0;
+    height: 100vh;
+  }
+
+  body.kiosk-mode .player-panel {
+    padding: 0;
+    border-radius: 0;
+    height: 100vh;
+  }
+
+  body.kiosk-mode #playerTitle {
+    display: none;
+  }
+
+  body.kiosk-mode video,
+  body.kiosk-mode .preview-image {
+    width: 100vw;
+    height: 100vh;
+    max-height: none;
+    border-radius: 0;
+    object-fit: contain;
+    background: black;
+  }  
 </style>
 """
 
@@ -1049,6 +1081,19 @@ async function loadVideos(resetOffset = false) {
   maybeAutoPlay(events);
 }
 
+function kioskFromUrl() {
+  const params = new URLSearchParams(window.location.search);
+  return params.get('kiosk') === 'true';
+}
+
+function setupKioskMode() {
+  if (!kioskFromUrl()) {
+    return;
+  }
+
+  document.body.classList.add('kiosk-mode');
+}
+
 function saveAutoPlaySelection() {
   const nodeId = selectedAutoPlayNodeId();
   const url = new URL(window.location);
@@ -1079,10 +1124,18 @@ function playClip(e, videoId, nodeId, localTime) {
   const player = document.getElementById('player');
   player.style.display = 'block';
   player.loop = false;
+
+  // Important for Chromium kiosk autoplay
+  player.muted = selectedAutoPlayNodeId() !== "";
+
   player.src = `/api/video/${videoId}`;
 
-  document.getElementById('playerTitle').innerText = `${nodeAliases[nodeId] || nodeId} — ${localTime}`;
-  player.play();
+  document.getElementById('playerTitle').innerText =
+    `${nodeAliases[nodeId] || nodeId} — ${localTime}`;
+
+  player.play()
+    .then(() => console.log("Video playback started"))
+    .catch(err => console.log("Video playback failed:", err));
 }
 
 async function triggerDelayed() {
@@ -1154,6 +1207,7 @@ async function refreshAll() {
 }
 
 refreshAll();
+setupKioskMode();
 
 document.getElementById('player').addEventListener('ended', async () => {
   const autoPlayNodeId = selectedAutoPlayNodeId();

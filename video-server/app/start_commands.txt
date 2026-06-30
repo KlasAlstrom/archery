@@ -1,0 +1,8 @@
+Fullscreen with autoplay
+
+chromium --kiosk \
+  --autoplay-policy=no-user-gesture-required \
+  --password-store=basic \
+  --disable-crash-reporter \
+  --disable-features=Crashpad \
+  "http://127.0.0.1/?autoplay=Cam-2ccf67d2c149-1&kiosk=true"
