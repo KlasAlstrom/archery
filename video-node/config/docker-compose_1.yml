@@ -1,0 +1,19 @@
+services:
+  video-node-cam1:
+    build: .
+    container_name: video-node-cam1
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+
+    devices:
+      - /dev/video0:/dev/video0
+
+    volumes:
+      - /dev/shm/video-node-cam1:/dev/shm/video-node
+      - ./config.yaml:/app/config.yaml:ro
+      - /dev/v4l:/dev/v4l:ro
+
+
+    environment:
+      - PYTHONUNBUFFERED=1

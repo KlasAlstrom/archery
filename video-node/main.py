@@ -318,54 +318,37 @@ def build_recording_command() -> list[str]:
             "-f", "image2",
             str(LIVE_JPEG_PATH),
         ]
-    
+
     if camera_cfg.get("type") == "rtsp":
         fps = str(camera_cfg.get("fps", 25))
-
         return [
             "ffmpeg",
             "-y",
             "-hide_banner",
-            "-loglevel",
-            "warning",
-            "-rtsp_transport",
-            "tcp",
-            "-i",
-            str(camera_cfg["rtsp_url"]),
+            "-loglevel", "warning",
+            "-rtsp_transport", "tcp",
+            "-i", str(camera_cfg["rtsp_url"]),
             "-an",
             "-filter_complex",
-            "[0:v]split=2[rec][live];"
-            "[rec]format=yuv420p[recout];"
-            "[live]scale=640:-1,fps=10[liveout]",
-            "-map",
-            "[recout]",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-crf",
-            "28",
-            "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})",
+            f"[0:v]split=2[rec][live];[rec]format=yuv420p[recout];[live]fps={LIVE_FPS},scale={LIVE_SCALE}[liveout]",
+            "-map", "[recout]",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "28",
             "-g", fps,
             "-keyint_min", fps,
-            "-sc_threshold", "0",            
-            "-f",
-            "segment",
-            "-segment_time",
-            str(SEGMENT_SECONDS),
-            "-segment_wrap",
-            str(SEGMENT_COUNT),
-            "-segment_format",
-            "mpegts",
-            "-reset_timestamps",
-            "1",
+            "-force_key_frames", f"expr:gte(t,n_forced*{SEGMENT_SECONDS})",
+            "-sc_threshold", "0",
+            "-f", "segment",
+            "-segment_time", str(SEGMENT_SECONDS),
+            "-segment_wrap", str(SEGMENT_COUNT),
+            "-segment_format", "mpegts",
+            "-reset_timestamps", "1",
             str(SEGMENT_PATTERN),
-            "-map",
-            "[liveout]",
-            "-q:v",
-            "5",
-            "-update",
-            "1",
+            "-map", "[liveout]",
+            "-q:v", "5",
+            "-update", "1",
+            "-f", "image2",
             str(LIVE_JPEG_PATH),
         ]
 
@@ -377,7 +360,7 @@ def start_ffmpeg() -> None:
 
     if ffmpeg_process is not None and ffmpeg_process.poll() is None:
         return
-    
+
     LIVE_JPEG_PATH.unlink(missing_ok=True)
 
     ffmpeg_process = subprocess.Popen(
@@ -450,6 +433,7 @@ async def heartbeat_worker() -> None:
                 data.add_field("node_id", NODE_ID)
                 data.add_field("status", heartbeat_status())
                 data.add_field("ip_address", get_local_ip())
+                data.add_field("port", str(cfg["trigger"]["port"]))
 
                 async with session.post(heartbeat_url, data=data, timeout=5) as response:
                     if response.status >= 400:

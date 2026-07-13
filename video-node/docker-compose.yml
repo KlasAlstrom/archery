@@ -1,17 +1,64 @@
 services:
-  video-node:
+  video-node-usb1:
     build: .
-    container_name: video-node
+    container_name: video-node-usb1
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config/config-usb1.yaml:/app/config.yaml:ro
+      - /dev/shm/video-node-usb1:/dev/shm/video-node
+      - /dev/v4l:/dev/v4l:ro
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+
+  video-node-usb2:
+    build: .
+    container_name: video-node-usb2
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./config/config-usb2.yaml:/app/config.yaml:ro
+      - /dev/shm/video-node-usb2:/dev/shm/video-node
+      - /dev/v4l:/dev/v4l:ro
+    devices:
+      - /dev/video2:/dev/video2
+      - /dev/video3:/dev/video3
+
+  video-node-picam:
+    build: .
+    container_name: video-node-picam
     restart: unless-stopped
     network_mode: host
     privileged: true
 
     devices:
       - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
 
     volumes:
-      - /dev/shm/video-node:/dev/shm/video-node
-      - ./config.yaml:/app/config.yaml:ro
+      - ./config/config-picam.yaml:/app/config.yaml:ro
+      - /dev/shm/video-node-picam:/dev/shm/video-node
+      - /dev/v4l:/dev/v4l:ro
+
+    environment:
+      - PYTHONUNBUFFERED=1
+
+  video-node-tapo:
+    build: .
+    container_name: video-node-tapo
+    restart: unless-stopped
+    network_mode: host
+    privileged: true
+
+    devices:
+      - /dev/video0:/dev/video0
+      - /dev/video1:/dev/video1
+
+    volumes:
+      - ./config/config-tapo-wifi.yaml:/app/config.yaml:ro
+      - /dev/shm/video-node-tapo:/dev/shm/video-node
+      - /dev/v4l:/dev/v4l:ro
 
     environment:
       - PYTHONUNBUFFERED=1

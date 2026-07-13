@@ -1,14 +1,14 @@
 camera:
-  index: 2
+  index: 1
   type: usb
-  device: /dev/video1
+  device: /dev/video0
   width: 1280
   height: 720
   fps: 30
   input_format: mjpeg
 
 buffer:
-  base_dir: /dev/shm/video-node2
+  base_dir: /dev/shm/video-node
   segment_seconds: 1
   extra_seconds: 10
 
@@ -17,7 +17,7 @@ trigger:
   post_seconds: 3
   pre_seconds_delayed: 8
   post_seconds_delayed: 5
-  port: 8080
+  port: 8081
 
 server:
   upload_url: http://192.168.60.1/api/upload

@@ -1,0 +1,31 @@
+camera:
+  index: 2
+  type: usb
+  device: /dev/video1
+  width: 1280
+  height: 720
+  fps: 30
+  input_format: mjpeg
+
+buffer:
+  base_dir: /dev/shm/video-node
+  segment_seconds: 1
+  extra_seconds: 10
+
+trigger:
+  pre_seconds: 5
+  post_seconds: 3
+  pre_seconds_delayed: 8
+  post_seconds_delayed: 5
+  port: 8082
+
+server:
+  upload_url: http://192.168.60.1/api/upload
+  token: archery-video-2026
+
+clip:
+  max_retry_seconds: 30
+
+power:
+  idle_timeout_seconds: 900
+  wake_on_trigger: true

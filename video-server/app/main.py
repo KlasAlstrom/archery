@@ -24,7 +24,7 @@ from typing import Any, Iterator
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
-from sqlalchemy import BigInteger, Column, DateTime, Integer, String, create_engine
+from sqlalchemy import BigInteger, Column, DateTime, Integer, String, create_engine, text
 from sqlalchemy.orm import Session, declarative_base, sessionmaker
 
 DATABASE_URL = os.environ["DATABASE_URL"]
@@ -66,6 +66,7 @@ class Node(Base):
     node_id = Column(String, primary_key=True)
     alias = Column(String, nullable=True)
     ip_address = Column(String, nullable=True)
+    port = Column(Integer, nullable=False, default=8080)
     last_seen = Column(DateTime, nullable=False)
     status = Column(String, nullable=False)
 
@@ -124,6 +125,7 @@ def node_to_dict(node: Node, now: datetime | None = None) -> dict[str, Any]:
         "status": node.status if online else "offline",
         "last_seen": utc_iso(node.last_seen),
         "ip_address": node.ip_address,
+        "port": node.port or 8080,
     }
 
 
@@ -207,13 +209,21 @@ def get_node_or_404(node_id: str) -> dict[str, str]:
         node = session.query(Node).filter(Node.node_id == node_id).first()
         if not node or not node.ip_address:
             raise HTTPException(status_code=404, detail="Node not found or missing IP")
-        return {"node_id": node.node_id, "ip_address": node.ip_address}
+        return {"node_id": node.node_id, "ip_address": node.ip_address, "port": str(node.port or 8080)}
 
 
 @app.on_event("startup")
 def startup() -> None:
     VIDEO_STORAGE.mkdir(parents=True, exist_ok=True)
     Base.metadata.create_all(bind=engine)
+
+    # Existing installations may already have a nodes table without the port column.
+    # create_all() does not alter existing tables, so add the column if needed.
+    with engine.begin() as connection:
+        try:
+            connection.execute(text("ALTER TABLE nodes ADD COLUMN port INTEGER DEFAULT 8080 NOT NULL"))
+        except Exception:
+            pass
 
 
 @app.post("/api/upload")
@@ -324,6 +334,7 @@ def heartbeat(
     node_id: str = Form(...),
     status: str = Form("ok"),
     ip_address: str | None = Form(None),
+    port: int = Form(8080),
     authorization: str | None = Header(default=None),
 ) -> dict[str, str]:
     require_node_token(authorization)
@@ -335,11 +346,13 @@ def heartbeat(
                 node_id=node_id,
                 alias=next_node_alias(session),
                 ip_address=ip_address,
+                port=port,
                 last_seen=utc_now(),
                 status=status,
             ))
         else:
             node.ip_address = ip_address
+            node.port = port
             node.last_seen = utc_now()
             node.status = status
         session.commit()
@@ -383,7 +396,7 @@ async def trigger_node(
 ) -> dict[str, Any]:
     try:
         response = await client.post(
-            f"http://{target['ip_address']}:8080/{endpoint}",
+            f"http://{target['ip_address']}:{target.get('port', 8080)}/{endpoint}",
             json={"event_id": event_id, "created_at": created_at},
         )
         return {
@@ -411,7 +424,7 @@ async def trigger_all(endpoint: str = "trigger") -> dict[str, Any]:
         now = utc_now()
         for node in session.query(Node).all():
             if node.ip_address and is_node_online(node, now):
-                targets.append({"node_id": node.node_id, "ip_address": node.ip_address})
+                targets.append({"node_id": node.node_id, "ip_address": node.ip_address, "port": node.port or 8080})
 
     async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
         results = await asyncio.gather(*[
@@ -506,7 +519,7 @@ def server_status() -> dict[str, Any]:
 async def api_wake_node(node_id: str) -> dict[str, Any]:
     node = get_node_or_404(node_id)
     async with httpx.AsyncClient(timeout=NODE_REQUEST_TIMEOUT) as client:
-        response = await client.post(f"http://{node['ip_address']}:8080/wake")
+        response = await client.post(f"http://{node['ip_address']}:{node['port']}/wake")
     return {"status": "ok", "node_id": node_id, "node_response": response.json()}
 
 
@@ -845,6 +858,13 @@ function nodeIp(nodeId) {
   return null;
 }
 
+function nodePort(nodeId) {
+  for (const n of window.latestNodes || []) {
+    if (n.node_id === nodeId) return n.port || 8080;
+  }
+  return 8080;
+}
+
 function selectedAutoPlayNodeId() {
   return document.getElementById('autoPlayNode').value;
 }
@@ -890,8 +910,11 @@ async function startLiveViewForAutoPlay() {
 
   live.style.display = 'block';
 
-  if (live.src !== `http://${ip}:8080/live`) {
-    live.src = `http://${ip}:8080/live`;
+  const port = nodePort(nodeId);
+  const liveUrl = `http://${ip}:${port}/live`;
+
+  if (live.src !== liveUrl) {
+    live.src = liveUrl;
   }
 }
 
@@ -1124,15 +1147,10 @@ function playClip(e, videoId, nodeId, localTime) {
   const player = document.getElementById('player');
   player.style.display = 'block';
   player.loop = false;
-
-  // Important for Chromium kiosk autoplay
   player.muted = selectedAutoPlayNodeId() !== "";
-
   player.src = `/api/video/${videoId}`;
 
-  document.getElementById('playerTitle').innerText =
-    `${nodeAliases[nodeId] || nodeId} — ${localTime}`;
-
+  document.getElementById('playerTitle').innerText = `${nodeAliases[nodeId] || nodeId} — ${localTime}`;
   player.play()
     .then(() => console.log("Video playback started"))
     .catch(err => console.log("Video playback failed:", err));
@@ -1224,7 +1242,8 @@ document.getElementById('player').addEventListener('ended', async () => {
 
   const player = document.getElementById('player');
   player.currentTime = 0;
-  player.play();
+  player.play()
+    .catch(err => console.log("Loop playback failed:", err));
 });
 
 setInterval(refreshAll, 10000);
